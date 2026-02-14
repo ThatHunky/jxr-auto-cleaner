@@ -1,0 +1,3 @@
+[submodule "third_party/libultrahdr"]
+	path = third_party/libultrahdr
+	url = https://github.com/google/libultrahdr.git

@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+bin/
+obj/
+out/
+
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+.clangd
+
+# Internal / Agent artifacts
+.gemini/
+process_icon.py
+
+# OS / Temporary files
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+*.tmp.jpg
+
+# Installer artifacts
+.wixobj
+*.msipdb
