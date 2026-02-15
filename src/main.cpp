@@ -111,7 +111,7 @@ static void CreateTrayIcon(HWND hwnd) {
   g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
   g_nid.uCallbackMessage = WM_TRAYICON;
   g_nid.hIcon = ::LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1));
-  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1");
+  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1.1");
 
   ::Shell_NotifyIconW(NIM_ADD, &g_nid);
 
@@ -175,7 +175,8 @@ static void WorkerThread() {
     if (IsSystemBusy()) {
       LogMsg(L"Worker: system busy, re-queuing %s", item->c_str());
       g_queue.push_front(std::move(*item));
-      ::Sleep(30000); // Wait 30 seconds before retrying
+      if (::WaitForSingleObject(g_shutdownEvent, 30000) == WAIT_OBJECT_0)
+        break;
       continue;
     }
 
@@ -199,7 +200,8 @@ static void WorkerThread() {
       if (err == ERROR_SHARING_VIOLATION) {
         LogMsg(L"Worker: file locked (attempt %d/%d): %s", retry + 1,
                MAX_RETRIES, filePath.c_str());
-        ::Sleep(2000);
+        if (::WaitForSingleObject(g_shutdownEvent, 2000) == WAIT_OBJECT_0)
+          break;
       } else if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
         LogMsg(L"Worker: file no longer exists: %s", filePath.c_str());
         break;
@@ -334,6 +336,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
   }
 
   // --- Background service mode ---
+  TrimLog();
   LogMsg(L"=== JxrAutoCleaner starting ===");
 
   // Single-instance check
@@ -414,6 +417,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
   // Shutdown sequence
   LogMsg(L"Shutting down...");
   ::SetEvent(g_shutdownEvent);
+  g_queue.shutdown();
 
   if (watcherThread.joinable())
     watcherThread.join();

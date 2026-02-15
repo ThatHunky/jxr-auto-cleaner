@@ -21,7 +21,7 @@ High Dynamic Range (HDR) screenshots taken via NVIDIA ShadowPlay are saved in th
 
 ## Usage
 
-1. **Install**: Run the `JxrAutoCleaner-v1.1.msi` installer. It will install to your local AppData folder and register itself to run at startup.
+1. **Install**: Run the `JxrAutoCleaner-v1.1.1.msi` installer. It will install to your local AppData folder and register itself to run at startup.
 2. **Setup**: By default, it monitors your Windows "Videos" library (where ShadowPlay typically saves screenshots).
 3. **Tray Icon**: Look for the icon in your system tray. Right-click it to:
    - **Force Run Now**: Manually trigger a scan of your folders.
