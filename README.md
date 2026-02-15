@@ -21,7 +21,7 @@ High Dynamic Range (HDR) screenshots taken via NVIDIA ShadowPlay are saved in th
 
 ## Usage
 
-1. **Install**: Run the `JxrAutoCleaner-v1.0.msi` installer. It will install to your local AppData folder and register itself to run at startup.
+1. **Install**: Run the `JxrAutoCleaner-v1.1.msi` installer. It will install to your local AppData folder and register itself to run at startup.
 2. **Setup**: By default, it monitors your Windows "Videos" library (where ShadowPlay typically saves screenshots).
 3. **Tray Icon**: Look for the icon in your system tray. Right-click it to:
    - **Force Run Now**: Manually trigger a scan of your folders.
@@ -60,8 +60,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ### Third-Party Licenses
 
-- **libultrahdr**: [Apache License 2.0](third_party/libultrahdr/LICENSE)
-- **libjpeg-turbo**: [IJG / BSD-style](third_party/libultrahdr/turbojpeg/LICENSE.md)
+- **libultrahdr**: [Apache License 2.0](https://github.com/google/libultrahdr/blob/main/LICENSE)
+- **libjpeg-turbo**: [IJG / BSD-style](https://github.com/libjpeg-turbo/libjpeg-turbo/blob/main/LICENSE.md)
 
 ## Credits
 

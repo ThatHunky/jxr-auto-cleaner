@@ -95,17 +95,29 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ 4. libultrahdr Encoding (HDR-only mode)                     │
+│ 4. scRGB → libultrahdr Luminance Rescaling                  │
+│    • Scale every pixel by 80/203 (≈0.3941)                  │
+│    • Maps scRGB SDR white (1.0 = 80 nits) to libultrahdr's  │
+│      expected range (1.0 = 203 nits per BT.2408)            │
+│    • Clamp negatives to 0 (out-of-gamut values)             │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 5. libultrahdr Encoding (HDR-only mode)                     │
 │    • uhdr_create_encoder()                                  │
 │    • uhdr_enc_set_raw_image(enc, &hdrImg, UHDR_HDR_IMG)     │
+│    • uhdr_enc_set_target_display_peak_brightness(4000 nits) │
+│    • uhdr_enc_set_using_multi_channel_gainmap(true)         │
+│    • uhdr_enc_set_preset(UHDR_USAGE_BEST_QUALITY)           │
 │    •   → Library internally tone-maps to SDR                │
-│    •   → Generates gain map                                 │
+│    •   → Generates multi-channel gain map                   │
 │    • uhdr_encode() → produces Ultra HDR JPEG                │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ 5. Atomic File Replacement                                  │
+│ 6. Atomic File Replacement                                  │
 │    • Write to "original.tmp.jpg"                            │
 │    • Delete "original.jxr" (with retry for locks)           │
 │    • Rename "original.tmp.jpg" → "original.jpg"             │
@@ -116,20 +128,24 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 
 **Color Space Mapping**:
 
-- **Input (scRGB)**: Linear RGB, BT.709 primaries, range [-0.5, 7.5]
-- **libultrahdr expects**: Linear RGB, BT.709, full range
-- **Mapping**: Direct pass-through — `UHDR_CT_LINEAR`, `UHDR_CG_BT_709`, `UHDR_CR_FULL_RANGE`
+- **Input (scRGB)**: Linear RGB, BT.709 primaries, SDR white = 1.0 (~80 nits)
+- **libultrahdr expects**: Linear RGB, BT.709, range [0.0..10000/203], where 1.0 = 203 nits (BT.2408)
+- **Rescaling**: Multiply all pixel values by `80/203 ≈ 0.3941` to align SDR white points
+- **Metadata**: `UHDR_CT_LINEAR`, `UHDR_CG_BT_709`, `UHDR_CR_FULL_RANGE`
+- **Negatives**: scRGB allows negative values (out-of-gamut); these are clamped to 0
 
 **Tone Mapping**:
 
 - Performed internally by `libultrahdr` when only `UHDR_HDR_IMG` is provided
-- Uses a perceptual tone curve optimized for mobile displays
+- Target display peak brightness set to **4000 nits** (vs. 10000 default)
+- Multi-channel gain map enabled for per-channel color accuracy
 - Gain map stores the "recovery function" to reconstruct HDR from SDR
 
 **Quality Settings**:
 
 - **Base (SDR) JPEG**: 95 (configurable, default from `jpegQuality` parameter)
-- **Gain Map**: 85 (fixed, balances quality vs. file size)
+- **Gain Map**: 95 (high quality for accurate HDR reconstruction)
+- **Encoder Preset**: `UHDR_USAGE_BEST_QUALITY`
 
 ---
 

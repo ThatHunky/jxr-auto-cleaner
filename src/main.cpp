@@ -111,7 +111,7 @@ static void CreateTrayIcon(HWND hwnd) {
   g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
   g_nid.uCallbackMessage = WM_TRAYICON;
   g_nid.hIcon = ::LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1));
-  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.0");
+  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1");
 
   ::Shell_NotifyIconW(NIM_ADD, &g_nid);
 

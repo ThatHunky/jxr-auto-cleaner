@@ -26,5 +26,10 @@ Desktop.ini
 *.tmp.jpg
 
 # Installer artifacts
+.wix/
 .wixobj
+*.wixpdb
 *.msipdb
+
+# Caches
+.cache/

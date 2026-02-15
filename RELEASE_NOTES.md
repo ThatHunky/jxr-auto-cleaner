@@ -1,46 +1,48 @@
-# JxrAutoCleaner v1.0
+# JxrAutoCleaner v1.1
 
-**Automatic JXR to Ultra HDR JPEG conversion for NVIDIA ShadowPlay screenshots**
+**Improved HDR conversion quality — accurate tone mapping and richer dynamic range**
 
-## 🎉 Initial Release
+## 🔧 What's Changed
 
-JxrAutoCleaner is a lightweight Windows background service that automatically converts NVIDIA ShadowPlay JXR screenshots to Ultra HDR JPEGs, preserving HDR information while reducing file size by ~90%.
+### HDR Conversion Quality Overhaul
 
-## ✨ Features
+The previous version had a luminance range mismatch that caused overblown highlights, washed-out SDR fallback, and underutilized HDR dynamic range. This release fixes all three root causes:
 
-- **Seamless Background Conversion**: Monitors your Videos folder and automatically converts new `.jxr` files
-- **HDR Preservation**: Uses Google's `libultrahdr` to create Ultra HDR JPEGs with embedded gain maps
-- **Smart Idle Detection**: Pauses conversion when gaming or CPU is busy (>25%)
-- **System Tray Integration**: Easy access to Force Run, Toggle Startup, and Exit
-- **File Size Reduction**: ~89% smaller files (11 MB JXR → 1.3 MB Ultra HDR JPEG)
-- **Per-User Installation**: No admin/UAC required, installs to `%LOCALAPPDATA%`
+- **Fixed scRGB → libultrahdr luminance mapping**: JXR screenshots use scRGB where SDR white = 1.0 (~80 nits), but libultrahdr expects 1.0 = 203 nits (BT.2408). Pixel values are now correctly rescaled by 80/203 before encoding, eliminating the ~2.5× brightness overestimation.
+- **Reduced target display peak brightness**: Changed from 10,000 nits (wasteful for gaming displays) to 4,000 nits, focusing gain map precision on the range monitors actually support (600–2,000 nits).
+- **Enabled multi-channel gain map**: Preserves per-channel color accuracy in bright highlights, preventing hue shifts in colored specular areas.
+- **Best quality encoder preset**: Now uses `UHDR_USAGE_BEST_QUALITY` for optimized encoding.
+- **Increased gain map quality**: 85 → 95, improving HDR reconstruction with negligible file size impact.
 
-## 📦 Installation
+### Result
 
-1. Download `JxrAutoCleaner-v1.0.msi` from the Assets below
-2. Run the installer (no admin rights needed)
-3. Follow the on-screen prompts to install
-4. **Launch JxrAutoCleaner** directly from the success screen, or find it in your Start Menu
-5. Look for the tray icon in your notification area
+| Aspect       | v1.0                       | v1.1                                         |
+| ------------ | -------------------------- | -------------------------------------------- |
+| Highlights   | Overblown / clipped        | Accurate, matching original JXR              |
+| SDR fallback | Harsh clipping, washed out | Natural tone mapping                         |
+| HDR pop      | Underutilized range        | Full dynamic range                           |
+| Gain map     | Single-channel, 85 quality | Multi-channel, 95 quality                    |
+| File sizes   | ~1.3 MB                    | ~1.5 MB (slightly larger for better quality) |
+
+## 📦 Upgrade Instructions
+
+**Existing v1.0 users**: Simply run `JxrAutoCleaner-v1.1.msi`. The installer will automatically upgrade -- no need to uninstall the old version first.
+
+**New users**: Download `JxrAutoCleaner-v1.1.msi` from the Assets below and run it.
 
 ## 🔧 System Requirements
 
 - Windows 10/11 (64-bit)
-- .NET Framework 4.8+ (usually pre-installed)
 - ~15 MB disk space
 
 ## 📖 Documentation
 
-- [README.md](https://github.com/YOUR_USERNAME/JxrAutoCleaner/blob/main/README.md) — User guide and features
-- [ARCHITECTURE.md](https://github.com/YOUR_USERNAME/JxrAutoCleaner/blob/main/ARCHITECTURE.md) — Technical documentation
+- [README.md](https://github.com/ThatHunky/jxr-auto-cleaner/blob/main/README.md) — User guide and features
+- [ARCHITECTURE.md](https://github.com/ThatHunky/jxr-auto-cleaner/blob/main/ARCHITECTURE.md) — Technical documentation
 
 ## 📜 License
 
 Released under the **MIT License**. See [LICENSE](LICENSE) for details.
-
-## 🐛 Known Issues
-
-None reported yet. Please open an issue if you encounter any problems!
 
 ## 🙏 Credits
 
@@ -50,4 +52,4 @@ None reported yet. Please open an issue if you encounter any problems!
 
 ---
 
-**Full Changelog**: Initial release
+**Full Changelog**: [v1.0...v1.1](https://github.com/ThatHunky/jxr-auto-cleaner/compare/v1.0...v1.1)

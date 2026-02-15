@@ -1,6 +1,8 @@
 #include "Converter.h"
 #include "Utils.h"
 
+#include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -13,6 +15,75 @@
 
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
+
+// ============================================================================
+// IEEE 754 half-float ↔ float conversion helpers
+// ============================================================================
+static inline float HalfToFloat(uint16_t h) {
+  uint32_t sign = (h & 0x8000u) << 16;
+  uint32_t exponent = (h >> 10) & 0x1F;
+  uint32_t mantissa = h & 0x03FF;
+
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      // ±0
+      uint32_t bits = sign;
+      float f;
+      std::memcpy(&f, &bits, 4);
+      return f;
+    }
+    // Subnormal: convert to normalized float
+    while (!(mantissa & 0x0400)) {
+      mantissa <<= 1;
+      exponent--;
+    }
+    exponent++;
+    mantissa &= ~0x0400u;
+    exponent += (127 - 15);
+    uint32_t bits = sign | (exponent << 23) | (mantissa << 13);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  } else if (exponent == 31) {
+    // Inf / NaN
+    uint32_t bits = sign | 0x7F800000u | (mantissa << 13);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  }
+
+  exponent += (127 - 15);
+  uint32_t bits = sign | (exponent << 23) | (mantissa << 13);
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+static inline uint16_t FloatToHalf(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, 4);
+
+  uint32_t sign = (bits >> 16) & 0x8000;
+  int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
+  uint32_t mantissa = bits & 0x007FFFFFu;
+
+  if (exponent <= 0) {
+    if (exponent < -10)
+      return static_cast<uint16_t>(sign); // Too small, flush to ±0
+    // Subnormal
+    mantissa |= 0x00800000u;
+    uint32_t shift = static_cast<uint32_t>(1 - exponent);
+    mantissa >>= shift;
+    return static_cast<uint16_t>(sign | (mantissa >> 13));
+  } else if (exponent >= 31) {
+    // Overflow → Inf, or NaN passthrough
+    if (exponent == 31 && mantissa != 0)
+      return static_cast<uint16_t>(sign | 0x7C00 | (mantissa >> 13)); // NaN
+    return static_cast<uint16_t>(sign | 0x7C00);                      // ±Inf
+  }
+
+  return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+}
 
 namespace jxr {
 
@@ -218,6 +289,24 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
     return false;
   }
 
+  // --- Rescale scRGB to libultrahdr's expected luminance range ---
+  // scRGB: SDR white = 1.0 (~80 nits, per sRGB/IEC 61966-2-1).
+  // libultrahdr's 64bppRGBAHalfFloat expects 1.0 = 203 nits (BT.2408).
+  // Scale factor: 80.0 / 203.0 maps scRGB 1.0 → 0.3941 (which the library
+  // correctly interprets as 80 nits, since 0.3941 × 203 ≈ 80).
+  {
+    constexpr float kScRGBToUhdr = 80.0f / 203.0f;
+    auto *pixels = reinterpret_cast<uint16_t *>(hdrPixels.data());
+    const size_t totalComponents = static_cast<size_t>(width) * height * 4;
+    for (size_t i = 0; i < totalComponents; ++i) {
+      float val = HalfToFloat(pixels[i]);
+      val *= kScRGBToUhdr;
+      if (val < 0.0f)
+        val = 0.0f; // Clamp negatives (out-of-gamut; invalid for Ultra HDR)
+      pixels[i] = FloatToHalf(val);
+    }
+  }
+
   // --- libultrahdr encode (HDR-only mode) ---
   uhdr_codec_private_t *enc = uhdr_create_encoder();
   if (!enc) {
@@ -248,6 +337,30 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
     return false;
   }
 
+  // --- Encoder tuning for high-quality HDR output ---
+
+  // Target display peak brightness (nits). Default for CT_LINEAR is 10000,
+  // which wastes gain map precision. 4000 nits covers current gaming displays
+  // with generous headroom for highlights.
+  err = uhdr_enc_set_target_display_peak_brightness(enc, 4000.0f);
+  if (err.error_code != UHDR_CODEC_OK) {
+    LogMsg(L"uhdr_enc_set_target_display_peak_brightness failed: %hs",
+           err.detail);
+    // Non-fatal: continue with default
+  }
+
+  // Multi-channel gain map preserves per-channel color accuracy in highlights
+  err = uhdr_enc_set_using_multi_channel_gainmap(enc, 1);
+  if (err.error_code != UHDR_CODEC_OK) {
+    LogMsg(L"uhdr_enc_set_using_multi_channel_gainmap failed: %hs", err.detail);
+  }
+
+  // Best quality preset for encoder tuning
+  err = uhdr_enc_set_preset(enc, UHDR_USAGE_BEST_QUALITY);
+  if (err.error_code != UHDR_CODEC_OK) {
+    LogMsg(L"uhdr_enc_set_preset failed: %hs", err.detail);
+  }
+
   // Set quality for SDR base image
   err = uhdr_enc_set_quality(enc, jpegQuality, UHDR_BASE_IMG);
   if (err.error_code != UHDR_CODEC_OK) {
@@ -256,8 +369,8 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
     return false;
   }
 
-  // Set quality for gain map image
-  err = uhdr_enc_set_quality(enc, 85, UHDR_GAIN_MAP_IMG);
+  // Set quality for gain map image (95 for better HDR reconstruction)
+  err = uhdr_enc_set_quality(enc, 95, UHDR_GAIN_MAP_IMG);
   if (err.error_code != UHDR_CODEC_OK) {
     LogMsg(L"uhdr_enc_set_quality (gain map) failed: %hs", err.detail);
     uhdr_release_encoder(enc);
