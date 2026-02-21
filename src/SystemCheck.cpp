@@ -15,7 +15,7 @@ bool IsGaming() {
   if (FAILED(hr))
     return false;
 
-  return (state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN ||
+  return (state == QUNS_RUNNING_D3D_FULL_SCREEN ||
           state == QUNS_PRESENTATION_MODE);
 }
 
@@ -30,24 +30,44 @@ static ULONGLONG FileTimeToU64(const FILETIME &ft) {
 }
 
 double GetCpuUsagePercent() {
-  FILETIME idleA, kernelA, userA;
-  if (!::GetSystemTimes(&idleA, &kernelA, &userA))
+  static FILETIME s_prevIdle = {0}, s_prevKernel = {0}, s_prevUser = {0};
+  static ULONGLONG s_prevTimeMs = 0;
+  static double s_lastCpu = 0.0;
+
+  ULONGLONG currentMs = ::GetTickCount64();
+  if (currentMs - s_prevTimeMs < 1000 && s_prevTimeMs != 0) {
+    return s_lastCpu;
+  }
+
+  FILETIME idle, kernel, user;
+  if (!::GetSystemTimes(&idle, &kernel, &user))
     return 0.0;
 
-  ::Sleep(1000); // 1-second sample window
-
-  FILETIME idleB, kernelB, userB;
-  if (!::GetSystemTimes(&idleB, &kernelB, &userB))
+  if (s_prevTimeMs == 0) {
+    s_prevIdle = idle;
+    s_prevKernel = kernel;
+    s_prevUser = user;
+    s_prevTimeMs = currentMs;
     return 0.0;
+  }
 
-  ULONGLONG idle = FileTimeToU64(idleB) - FileTimeToU64(idleA);
-  ULONGLONG kernel = FileTimeToU64(kernelB) - FileTimeToU64(kernelA);
-  ULONGLONG user = FileTimeToU64(userB) - FileTimeToU64(userA);
-  ULONGLONG total = kernel + user;
+  ULONGLONG idleDiff = FileTimeToU64(idle) - FileTimeToU64(s_prevIdle);
+  ULONGLONG kernelDiff = FileTimeToU64(kernel) - FileTimeToU64(s_prevKernel);
+  ULONGLONG userDiff = FileTimeToU64(user) - FileTimeToU64(s_prevUser);
+  ULONGLONG totalDiff = kernelDiff + userDiff;
 
-  if (total == 0)
-    return 0.0;
-  return (1.0 - static_cast<double>(idle) / static_cast<double>(total)) * 100.0;
+  s_prevIdle = idle;
+  s_prevKernel = kernel;
+  s_prevUser = user;
+  s_prevTimeMs = currentMs;
+
+  if (totalDiff == 0) {
+    s_lastCpu = 0.0;
+  } else {
+    s_lastCpu = (1.0 - static_cast<double>(idleDiff) / static_cast<double>(totalDiff)) * 100.0;
+  }
+
+  return s_lastCpu;
 }
 
 // ============================================================================

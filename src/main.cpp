@@ -5,6 +5,7 @@
 #include "Utils.h"
 #include "resource.h"
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <shellapi.h>
@@ -23,6 +24,8 @@ static ThreadSafeQueue<std::wstring> g_queue;
 static NOTIFYICONDATAW g_nid = {};
 static std::wstring g_videosDir;
 static HINSTANCE g_hInstance = nullptr;
+static std::atomic<bool> g_forceRunActive = false;
+static HANDLE g_wakeEvent = nullptr;
 
 // ============================================================================
 // Registry helpers for startup toggle
@@ -75,6 +78,10 @@ static void RemoveFromStartup() {
 // ============================================================================
 static void ForceScanNow() {
   LogMsg(L"Force scan requested");
+  g_forceRunActive = true;
+  if (g_wakeEvent) {
+    ::SetEvent(g_wakeEvent);
+  }
   int count = 0;
   try {
     for (const auto &entry : fs::recursive_directory_iterator(g_videosDir)) {
@@ -111,7 +118,7 @@ static void CreateTrayIcon(HWND hwnd) {
   g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
   g_nid.uCallbackMessage = WM_TRAYICON;
   g_nid.hIcon = ::LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1));
-  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1.1");
+  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1.2");
 
   ::Shell_NotifyIconW(NIM_ADD, &g_nid);
 
@@ -168,14 +175,17 @@ static void WorkerThread() {
   while (::WaitForSingleObject(g_shutdownEvent, 0) != WAIT_OBJECT_0) {
     // Wait for a file to appear in the queue (30 second timeout)
     auto item = g_queue.wait_and_pop(std::chrono::seconds(30));
-    if (!item.has_value())
+    if (!item.has_value()) {
+      g_forceRunActive = false;
       continue;
+    }
 
     // Check if system is busy
-    if (IsSystemBusy()) {
+    if (!g_forceRunActive && IsSystemBusy()) {
       LogMsg(L"Worker: system busy, re-queuing %s", item->c_str());
       g_queue.push_front(std::move(*item));
-      if (::WaitForSingleObject(g_shutdownEvent, 30000) == WAIT_OBJECT_0)
+      HANDLE events[2] = {g_shutdownEvent, g_wakeEvent};
+      if (::WaitForMultipleObjects(2, events, FALSE, 30000) == WAIT_OBJECT_0)
         break;
       continue;
     }
@@ -366,6 +376,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
       ::CloseHandle(hMutex);
     return 1;
   }
+  g_wakeEvent = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
   // Register hidden window class
   WNDCLASSEXW wc = {};
@@ -427,6 +438,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
   RemoveTrayIcon();
 
   ::CloseHandle(g_shutdownEvent);
+  if (g_wakeEvent)
+    ::CloseHandle(g_wakeEvent);
   if (hwnd)
     ::DestroyWindow(hwnd);
   if (hMutex)

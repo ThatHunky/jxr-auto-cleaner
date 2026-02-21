@@ -1,28 +1,25 @@
-# JxrAutoCleaner v1.1.1
+# JxrAutoCleaner v1.1.2
 
-**Patch release — fixes tray Exit button and adds log rotation**
+**Patch release — completely fixes system busy false positives and makes manual Force Runs instantaneous**
 
-## � Bug Fixes
+## 🐛 Bug Fixes
 
-### Tray "Exit" now properly kills the process
+### Force Scan Now is truly instant ⚡
 
-The worker thread had blocking `Sleep()` calls and a condition variable wait that didn't respond to the shutdown signal. Clicking "Exit" would leave the process hanging for up to 30 seconds (or indefinitely if stuck in a retry loop).
+We've removed the 30-second blocking delay from the worker thread. Clicking "Force Scan Now" will now immediately wake up the background process and start converting your screenshots right away, without waiting for the internal timer to pop.
 
-**Fixed by:**
+### "System Busy" False Positives eliminated 🛑
 
-- Adding a `shutdown()` method to `ThreadSafeQueue` that wakes all blocked `wait_and_pop()` calls immediately
-- Replacing all `Sleep()` calls in the worker thread with `WaitForSingleObject(shutdownEvent)` so they respond to exit instantly
+We fixed a massive bug where the application would forever think you were gaming or in full-screen mode if you had Windows "Focus Assist" or "Do Not Disturb" turned on. The service now correctly distinguishes between actual 3D full-screen gaming and regular DND mode.
 
-## ✨ Improvements
+### CPU Timing rewritten ⏱️
 
-### Log rotation (500-line cap)
-
-`log.txt` previously grew unbounded. Now on each startup, if the log exceeds 500 lines, it's trimmed to the most recent 500.
+The background CPU check previously blocked the thread completely for 1 second for every single image it processed. This has been completely refactored with high-performance tick counters to ensure smooth and fast conversions when multiple images are queued.
 
 ## 📦 Upgrade Instructions
 
-**Existing users**: Simply run `JxrAutoCleaner-v1.1.1.msi` — it will automatically upgrade in-place.
+**Existing users**: Simply run `JxrAutoCleaner-v1.1.2.msi` — it will automatically upgrade in-place.
 
 ---
 
-**Full Changelog**: [v1.1...v1.1.1](https://github.com/ThatHunky/jxr-auto-cleaner/compare/v1.1...v1.1.1)
+**Full Changelog**: [v1.1.1...v1.1.2](https://github.com/ThatHunky/jxr-auto-cleaner/compare/v1.1.1...v1.1.2)
