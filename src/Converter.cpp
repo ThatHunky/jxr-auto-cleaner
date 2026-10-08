@@ -123,16 +123,16 @@ static bool FinalizeOutput(const fs::path &tempPath, const fs::path &finalPath,
   std::error_code ec;
   fs::rename(tempPath, finalPath, ec);
   if (ec) {
-    LogMsg(L"Failed to rename temp file to final: %hs", ec.message().c_str());
+    LogMsg(L"Failed to rename temp file to final: %s", ErrorText(ec).c_str());
     fs::remove(tempPath, ec);
     return false;
   }
 
   fs::remove(inputPath, ec);
   if (ec) {
-    LogMsg(L"Could not delete original JXR (locked?): %hs — keeping both "
+    LogMsg(L"Could not delete original JXR (locked?): %s — keeping both "
            L"files",
-           ec.message().c_str());
+           ErrorText(ec).c_str());
   }
 
   const uintmax_t size = fs::file_size(finalPath, ec);
@@ -274,11 +274,12 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
     return false;
   }
 
-  // Simple WIC transcode for SDR sources (and HDR formats WIC can't convert
-  // to half float). Releases the WIC objects so the source can be deleted.
-  auto transcodeSdr = [&]() {
+  // If SDR (8-bit), do a simple transcode without libultrahdr
+  if (!IsHdrPixelFormat(pixFmt)) {
+    LogMsg(L"SDR pixel format detected, performing simple JPEG transcode");
     bool ok =
         TranscodeSdrJxrToJpeg(factory, frame, tempPath.wstring(), jpegQuality);
+    // Release all WIC COM objects to unlock the source file
     frame.Reset();
     decoder.Reset();
     factory.Reset();
@@ -288,11 +289,6 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
       return false;
     }
     return FinalizeOutput(tempPath, finalPath, inputPath);
-  };
-
-  if (!IsHdrPixelFormat(pixFmt)) {
-    LogMsg(L"SDR pixel format detected, performing simple JPEG transcode");
-    return transcodeSdr();
   }
 
   // --- HDR path: convert to half-float RGBA ---
@@ -310,11 +306,9 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
                              WICBitmapDitherTypeNone, nullptr, 0.0,
                              WICBitmapPaletteTypeCustom);
   if (FAILED(hr)) {
-    LogMsg(L"HDR format conversion failed: 0x%08X, falling back to SDR "
-           L"transcode",
-           hr);
-    converter.Reset();
-    return transcodeSdr();
+    // No SDR fallback on purpose: it would delete the only HDR copy.
+    LogMsg(L"HDR format conversion failed: 0x%08X, keeping the JXR", hr);
+    return false;
   }
 
   UINT width, height;

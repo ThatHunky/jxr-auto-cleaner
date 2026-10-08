@@ -33,8 +33,10 @@ High Dynamic Range (HDR) screenshots taken via NVIDIA ShadowPlay are saved in th
 You can also use the service as a CLI tool for manual conversions:
 
 ```powershell
-.\JxrAutoCleaner.exe --convert "C:\Path\To\Screenshot.jxr"
+.\JxrAutoCleaner.exe --convert "C:\Path\To\Screenshot.jxr" | Out-Default
 ```
+
+It's a GUI-subsystem app, so the shell doesn't wait for it by default. Piping (as above) or `start /wait` in `cmd` makes it wait, so the output and exit code come back in order.
 
 ## Build Instructions
 

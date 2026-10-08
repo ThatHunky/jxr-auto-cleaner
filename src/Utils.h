@@ -178,6 +178,49 @@ inline void TrimLog(size_t maxLines = 500) {
 }
 
 // ============================================================================
+// Readable text for a filesystem error_code. ec.message() is in the ANSI code
+// page (localized on non-English Windows), which would garble the UTF-8 log.
+// ============================================================================
+inline std::wstring ErrorText(const std::error_code &ec) {
+  if (ec.category() == std::system_category()) {
+    wchar_t *buf = nullptr;
+    DWORD n = ::FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+            FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, static_cast<DWORD>(ec.value()), 0,
+        reinterpret_cast<LPWSTR>(&buf), 0, nullptr);
+    if (n && buf) {
+      std::wstring text(buf, n);
+      ::LocalFree(buf);
+      while (!text.empty() && (text.back() == L'\n' || text.back() == L'\r'))
+        text.pop_back();
+      return text;
+    }
+  }
+  return L"error " + std::to_wstring(ec.value());
+}
+
+// ============================================================================
+// Calls fn(path) for every regular file under dir, skipping folders we can't
+// read. Returns false (and logs) if the walk stopped early.
+// ============================================================================
+template <typename Fn> bool ForEachFile(const std::wstring &dir, Fn &&fn) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::recursive_directory_iterator it(
+      dir, fs::directory_options::skip_permission_denied, ec);
+  for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    std::error_code fileEc;
+    if (it->is_regular_file(fileEc))
+      fn(it->path());
+  }
+  if (ec)
+    LogMsg(L"Scan of '%s' stopped early: %s", dir.c_str(),
+           ErrorText(ec).c_str());
+  return !ec;
+}
+
+// ============================================================================
 // Case-insensitive extension check, e.g. HasExtension(p, L".jxr")
 // ============================================================================
 inline bool HasExtension(const std::filesystem::path &p, const wchar_t *ext) {

@@ -158,7 +158,8 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 - **Handles**:
   - `WM_TRAYICON` — Tray icon events (right-click menu)
   - `WM_COMMAND` — Menu selections (Force Run, Toggle Startup, Exit)
-  - `WM_ENDSESSION` — Windows shutdown/logoff
+  - `WM_ENDSESSION` — Windows shutdown/logoff (threads are stopped inside the handler)
+  - `TaskbarCreated` — Explorer restarted; re-adds the tray icon
   - `WM_CLOSE` / `WM_DESTROY` — Application exit
 
 ### Watcher Thread
@@ -274,10 +275,11 @@ for (int retry = 0; retry < 5; ++retry) {
 
 ### Orphan Cleanup
 
-On startup (before the worker starts), scans for leftover `.tmp.jpg` files from previous crashes:
+When the worker thread starts, before it converts anything, it scans for leftover `.tmp.jpg` files from previous crashes. The worker is the only writer of temp files, so none can be mid-write at that point.
 
 - If the matching `.jxr` still exists, the temp file is a partial write and is deleted.
-- If the `.jxr` is gone and no `.jpg` exists, the temp file is the finished output left by pre-1.1.2 versions (which deleted before renaming), so it is renamed to `.jpg` instead of being thrown away.
+- If the `.jxr` is gone, the temp file ends with the JPEG EOI marker (`FF D9`), and no `.jpg` exists, it is the finished output left by pre-1.1.2 versions (which deleted before renaming). It is renamed to `.jpg` instead of being thrown away.
+- In every other case (truncated, name taken, or the existence check errored), the file is left alone and logged.
 
 ---
 
@@ -379,7 +381,7 @@ target_link_libraries(JxrAutoCleaner PRIVATE
 | -------------------------------------- | ----------------------------------------- |
 | **File locked by ShadowPlay**          | Retry 5 times with 2s delay, then skip    |
 | **Disk full during write**             | Temp file write fails, original preserved |
-| **HDR format WIC can't convert**       | Falls back to SDR WIC JPEG transcode      |
+| **HDR format WIC can't convert**       | Logs error, keeps the JXR untouched       |
 | **Corrupt JXR**                        | WIC decode fails, logs error, skips file  |
 | **Non-HDR JXR**                        | Falls back to simple WIC JPEG transcode   |
 | **Buffer overflow (too many changes)** | Fallback to full directory scan           |

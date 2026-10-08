@@ -14,25 +14,18 @@ namespace jxr {
 size_t QueueUnconvertedJxrFiles(const std::wstring &dir,
                                 ThreadSafeQueue<std::wstring> &queue) {
   size_t count = 0;
-  std::error_code ec;
-  fs::recursive_directory_iterator it(
-      dir, fs::directory_options::skip_permission_denied, ec);
-  for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-    const fs::directory_entry &entry = *it;
-    std::error_code fileEc;
-    if (!entry.is_regular_file(fileEc) || !HasExtension(entry.path(), L".jxr"))
-      continue;
+  ForEachFile(dir, [&](const fs::path &path) {
+    if (!HasExtension(path, L".jxr"))
+      return;
     // Skip if a .jpg already exists (already converted)
-    fs::path jpgPath = entry.path();
+    fs::path jpgPath = path;
     jpgPath.replace_extension(L".jpg");
-    if (fs::exists(jpgPath, fileEc))
-      continue;
-    queue.push(entry.path().wstring());
+    std::error_code ec;
+    if (fs::exists(jpgPath, ec))
+      return;
+    queue.push(path.wstring());
     ++count;
-  }
-  if (ec)
-    LogMsg(L"Scan of '%s' stopped early: %hs", dir.c_str(),
-           ec.message().c_str());
+  });
   return count;
 }
 
@@ -72,8 +65,20 @@ void FileWatcher::Run(const std::wstring &watchDir,
   constexpr DWORD BUF_SIZE = 64 * 1024; // 64 KB
   std::vector<uint8_t> buffer(BUF_SIZE);
 
+  OVERLAPPED overlapped = {};
+
+  // Cancel an in-flight read and wait for it to finish, so the kernel can't
+  // write into `overlapped` or `buffer` after we leave Run().
+  auto cancelPendingRead = [&] {
+    if (::CancelIoEx(hDir, &overlapped) ||
+        ::GetLastError() != ERROR_NOT_FOUND) {
+      DWORD ignored = 0;
+      ::GetOverlappedResult(hDir, &overlapped, &ignored, TRUE);
+    }
+  };
+
   while (true) {
-    OVERLAPPED overlapped = {};
+    overlapped = {};
     overlapped.hEvent = hEvent;
     ::ResetEvent(hEvent);
 
@@ -97,13 +102,7 @@ void FileWatcher::Run(const std::wstring &watchDir,
 
     if (waitResult == WAIT_OBJECT_0 + 1) {
       // Shutdown signaled
-      // Wait for the cancelled read to complete before `overlapped` and
-      // `buffer` go out of scope, or the kernel may write into freed memory.
-      if (::CancelIoEx(hDir, &overlapped) ||
-          ::GetLastError() != ERROR_NOT_FOUND) {
-        DWORD ignored = 0;
-        ::GetOverlappedResult(hDir, &overlapped, &ignored, TRUE);
-      }
+      cancelPendingRead();
       LogMsg(L"FileWatcher: shutdown signaled, exiting");
       break;
     }
@@ -158,6 +157,7 @@ void FileWatcher::Run(const std::wstring &watchDir,
     } else {
       // Unexpected wait result
       LogMsg(L"FileWatcher: unexpected wait result %u", waitResult);
+      cancelPendingRead();
       break;
     }
   }

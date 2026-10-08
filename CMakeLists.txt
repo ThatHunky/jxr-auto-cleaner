@@ -35,6 +35,7 @@ target_link_libraries(JxrAutoCleaner PRIVATE
     ole32
     shlwapi
     shell32
+    advapi32
 )
 
 # For ComPtr

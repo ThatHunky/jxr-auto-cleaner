@@ -6,10 +6,15 @@
 #include "resource.h"
 
 #include <chrono>
+#include <fcntl.h>
 #include <filesystem>
+#include <fstream>
+#include <io.h>
+#include <sddl.h>
 #include <shellapi.h>
 #include <string>
 #include <thread>
+#include <vector>
 #include <windows.h>
 
 namespace fs = std::filesystem;
@@ -23,6 +28,8 @@ static ThreadSafeQueue<std::wstring> g_queue;
 static NOTIFYICONDATAW g_nid = {};
 static std::wstring g_videosDir;
 static HINSTANCE g_hInstance = nullptr;
+static std::thread g_watcherThread;
+static std::thread g_workerThread;
 
 // ============================================================================
 // Registry helpers for startup toggle
@@ -85,33 +92,54 @@ static void ForceScanNow() {
 // ============================================================================
 // Startup: deal with "<name>.tmp.jpg" files left by a crash mid-conversion
 // ============================================================================
+// A complete JPEG (including an Ultra HDR one, whose gain map JPEG is appended
+// last) ends with the EOI marker FF D9; a write cut short by a crash doesn't.
+static bool EndsWithJpegEoi(const fs::path &path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f || f.tellg() < 2)
+    return false;
+  f.seekg(-2, std::ios::end);
+  unsigned char tail[2] = {};
+  f.read(reinterpret_cast<char *>(tail), 2);
+  return f && tail[0] == 0xFF && tail[1] == 0xD9;
+}
+
 static void CleanUpOrphanTempFiles(const std::wstring &dir) {
-  std::error_code ec;
-  fs::recursive_directory_iterator it(
-      dir, fs::directory_options::skip_permission_denied, ec);
-  for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-    const fs::path &tmp = it->path();
-    std::error_code fileEc;
-    if (!it->is_regular_file(fileEc) || !HasExtension(tmp, L".jpg") ||
-        !HasExtension(tmp.stem(), L".tmp"))
-      continue;
+  ForEachFile(dir, [](const fs::path &tmp) {
+    if (!HasExtension(tmp, L".jpg") || !HasExtension(tmp.stem(), L".tmp"))
+      return;
 
     fs::path jxr = tmp.parent_path() / tmp.stem();
     jxr.replace_extension(L".jxr");
     fs::path jpg = jxr;
     jpg.replace_extension(L".jpg");
 
-    if (fs::exists(jxr, fileEc)) {
-      // The source survived, so the temp file is a partial write: drop it.
+    std::error_code ec;
+    bool jxrExists = fs::exists(jxr, ec);
+    if (ec)
+      return; // can't tell; leave everything alone
+    bool jpgExists = fs::exists(jpg, ec);
+    if (ec)
+      return;
+
+    if (jxrExists) {
+      // The source survived, so the temp is a partial write: drop it.
       LogMsg(L"Removing partial temp file: %s", tmp.wstring().c_str());
-      fs::remove(tmp, fileEc);
-    } else if (!fs::exists(jpg, fileEc)) {
+      fs::remove(tmp, ec);
+    } else if (!EndsWithJpegEoi(tmp)) {
+      // Truncated, but the only thing left of that screenshot: don't delete.
+      LogMsg(L"Leaving incomplete orphan temp file: %s", tmp.wstring().c_str());
+    } else if (!jpgExists) {
       // Versions before 1.1.2 deleted the JXR before renaming the finished
       // temp file, so this may be the only copy left. Recover it.
       LogMsg(L"Recovering orphan temp file: %s", tmp.wstring().c_str());
-      fs::rename(tmp, jpg, fileEc);
+      fs::rename(tmp, jpg, ec);
+    } else {
+      // Complete output, but its name is taken: leave it for the user.
+      LogMsg(L"Leaving orphan temp file (%s already exists): %s",
+             jpg.wstring().c_str(), tmp.wstring().c_str());
     }
-  }
+  });
 }
 
 // ============================================================================
@@ -177,6 +205,12 @@ static void WorkerThread() {
   }
 
   LogMsg(L"Worker: started");
+
+  // Runs here, not on the main thread: the worker is the only writer of temp
+  // files, so nothing can be mid-write yet, the watcher is already running,
+  // and the tray stays responsive during a long scan.
+  CleanUpOrphanTempFiles(g_videosDir);
+
   constexpr int MAX_RETRIES = 5;
   bool wasBusy = false;
 
@@ -270,6 +304,19 @@ static void WatcherThread(const std::wstring &videosDir) {
 }
 
 // ============================================================================
+// Signal and join the background threads. Safe to call more than once.
+// ============================================================================
+static void StopBackgroundThreads() {
+  if (g_shutdownEvent)
+    ::SetEvent(g_shutdownEvent);
+  g_queue.shutdown();
+  if (g_watcherThread.joinable())
+    g_watcherThread.join();
+  if (g_workerThread.joinable())
+    g_workerThread.join();
+}
+
+// ============================================================================
 // Window proc for tray icon and shutdown
 // ============================================================================
 static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wp,
@@ -317,7 +364,15 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wp,
     // wParam == FALSE means the session end was cancelled; keep running.
     if (!wp)
       return 0;
-    [[fallthrough]];
+    // Windows may end the process as soon as this returns, so stop the
+    // threads here rather than after the message loop.
+    LogMsg(L"Session ending, shutting down...");
+    RemoveTrayIcon();
+    StopBackgroundThreads();
+    LogMsg(L"=== JxrAutoCleaner stopped (session end) ===");
+    ::PostQuitMessage(0);
+    return 0;
+
   case WM_CLOSE:
     RemoveTrayIcon();
     if (g_shutdownEvent)
@@ -334,16 +389,49 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wp,
 }
 
 // ============================================================================
+// Single-instance mutex name: Global\ so the same user can't run a duplicate
+// from a second session (RDP, fast user switching) on the same Videos folder,
+// suffixed with the user's SID so different users each get their own.
+// ============================================================================
+static std::wstring InstanceMutexName() {
+  std::wstring name = L"Global\\JxrAutoCleanerMutex";
+  HANDLE token = nullptr;
+  if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
+    return name;
+  DWORD size = 0;
+  ::GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+  std::vector<BYTE> buf(size);
+  wchar_t *sid = nullptr;
+  if (size &&
+      ::GetTokenInformation(token, TokenUser, buf.data(), size, &size) &&
+      ::ConvertSidToStringSidW(
+          reinterpret_cast<TOKEN_USER *>(buf.data())->User.Sid, &sid)) {
+    name += L"-";
+    name += sid;
+    ::LocalFree(sid);
+  }
+  ::CloseHandle(token);
+  return name;
+}
+
+// ============================================================================
 // CLI mode: --convert <file>
 // ============================================================================
 static int RunCliConvert(const std::wstring &filePath) {
-  // This is a WIN32-subsystem exe, so stdout/stderr go nowhere unless we
-  // attach to the console of the shell that launched us.
-  if (::AttachConsole(ATTACH_PARENT_PROCESS)) {
+  // This is a WIN32-subsystem exe: unless output was redirected, stdout and
+  // stderr go nowhere, so attach to the console of the launching shell.
+  HANDLE out = ::GetStdHandle(STD_OUTPUT_HANDLE);
+  if ((!out || out == INVALID_HANDLE_VALUE) &&
+      ::AttachConsole(ATTACH_PARENT_PROCESS)) {
     FILE *ignored = nullptr;
     freopen_s(&ignored, "CONOUT$", "w", stdout);
     freopen_s(&ignored, "CONOUT$", "w", stderr);
   }
+  // Unicode output, so non-ASCII paths aren't cut off at the first such char
+  if (_fileno(stdout) >= 0)
+    _setmode(_fileno(stdout), _O_U8TEXT);
+  if (_fileno(stderr) >= 0)
+    _setmode(_fileno(stderr), _O_U8TEXT);
 
   ComInit com;
   if (!com) {
@@ -385,10 +473,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   }
 
   // --- Background service mode ---
-  // Single-instance check
-  // Per-session (Local) mutex: a Global one would stop a second signed-in
-  // user from running their own instance for their own Videos folder.
-  HANDLE hMutex = ::CreateMutexW(nullptr, TRUE, L"Local\\JxrAutoCleanerMutex");
+  // v1.1.1 and earlier held this unsuffixed name machine-wide. Don't run next
+  // to one (e.g. mid-upgrade), or both would convert the same files.
+  if (HANDLE legacy =
+          ::OpenMutexW(SYNCHRONIZE, FALSE, L"Global\\JxrAutoCleanerMutex")) {
+    ::CloseHandle(legacy);
+    LogMsg(L"An older JxrAutoCleaner is running, exiting");
+    return 0;
+  }
+
+  // Single-instance check, one per user (see InstanceMutexName)
+  HANDLE hMutex =
+      ::CreateMutexW(nullptr, TRUE, InstanceMutexName().c_str());
   if (::GetLastError() == ERROR_ALREADY_EXISTS) {
     LogMsg(L"Another instance is already running, exiting");
     if (hMutex)
@@ -444,13 +540,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   // Create tray icon
   CreateTrayIcon(hwnd);
 
-  // Must finish before the worker starts, or it could delete a temp file the
-  // worker is writing.
-  CleanUpOrphanTempFiles(g_videosDir);
-
-  // Start threads
-  std::thread watcherThread(WatcherThread, g_videosDir);
-  std::thread workerThread(WorkerThread);
+  // Start threads (the worker cleans up orphan temp files first)
+  g_watcherThread = std::thread(WatcherThread, g_videosDir);
+  g_workerThread = std::thread(WorkerThread);
 
   // Message pump (keeps the process alive, handles tray messages)
   MSG msg;
@@ -461,17 +553,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
   // Shutdown sequence
   LogMsg(L"Shutting down...");
-  ::SetEvent(g_shutdownEvent);
-  g_queue.shutdown();
-
-  if (watcherThread.joinable())
-    watcherThread.join();
-  if (workerThread.joinable())
-    workerThread.join();
-
+  StopBackgroundThreads();
   RemoveTrayIcon();
 
   ::CloseHandle(g_shutdownEvent);
+  g_shutdownEvent = nullptr;
   ::DestroyWindow(hwnd);
   if (hMutex)
     ::CloseHandle(hMutex);
