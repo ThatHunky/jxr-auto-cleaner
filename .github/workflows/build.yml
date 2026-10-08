@@ -36,13 +36,9 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      # Same version as setup.bat; extensions come from the repo's .wix/ cache.
       - name: Install WiX
-        shell: pwsh
-        run: |
-          dotnet tool install --global wix --version 6.0.2
-          # WiX 6 refuses to build until its EULA is accepted (same as a local
-          # setup.bat build). Extensions come from the repo's .wix/ cache.
-          wix eula accept wix6
+        run: dotnet tool install --global wix --version 6.0.2
 
       - name: Build MSI
         run: >
