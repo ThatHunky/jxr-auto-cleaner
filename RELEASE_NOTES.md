@@ -1,28 +1,52 @@
-# JxrAutoCleaner v1.1.1
+# JxrAutoCleaner v1.1.3
 
-**Patch release — fixes tray Exit button and adds log rotation**
+**Patch release: fixes a data-loss bug, plus shutdown, tray and logging fixes**
 
-## � Bug Fixes
+## 🐛 Bug Fixes
 
-### Tray "Exit" now properly kills the process
+### Screenshots can no longer be lost when a conversion fails halfway
 
-The worker thread had blocking `Sleep()` calls and a condition variable wait that didn't respond to the shutdown signal. Clicking "Exit" would leave the process hanging for up to 30 seconds (or indefinitely if stuck in a retry loop).
+The converter used to delete the original `.jxr` **before** renaming the finished `.tmp.jpg` to `.jpg`. If the rename failed (for example, a viewer had the `.jpg` open), the only copy left was `X.tmp.jpg`, and the orphan cleanup deleted it on the next startup.
 
 **Fixed by:**
 
-- Adding a `shutdown()` method to `ThreadSafeQueue` that wakes all blocked `wait_and_pop()` calls immediately
-- Replacing all `Sleep()` calls in the worker thread with `WaitForSingleObject(shutdownEvent)` so they respond to exit instantly
+- Renaming the output into place first, and deleting the original only after that succeeds
+- Checking the JPEG write for errors (such as a full disk), so a truncated file is never promoted over the original
+- Changing the startup cleanup so it deletes `X.tmp.jpg` only when `X.jxr` still exists. A complete orphan (one that ends with the JPEG end marker) left by an older version is recovered as `X.jpg`. Anything else is left in place and logged.
+- Running the startup cleanup on the worker thread before it converts anything, so it can't delete a temp file that is still being written. The tray also stays responsive during the scan.
+
+### Exit and shutdown
+
+- Closing the window (`WM_CLOSE`) now really ends the process; before, the threads stopped but the process stayed alive
+- Logoff and shutdown (`WM_ENDSESSION`) now actually reach the app; the message-only window never received them. The threads stop inside the handler, before Windows can end the process. A cancelled logoff leaves the app running.
+- The watcher waits for any pending read before it exits, which fixes possible heap corruption
+
+### Tray icon survives Explorer restarts
+
+The app used a message-only window, which never receives broadcasts, so the icon disappeared for good after an Explorer crash or restart and the app could only be stopped from Task Manager. It now uses a hidden top-level window and re-adds the icon on `TaskbarCreated`.
+
+### Other fixes
+
+- Several filesystem calls that could throw on a worker thread (which crashes the whole app) now report errors instead
+- Scans skip folders they can't read instead of stopping at the first one
+- Watcher buffer overflows reported as `ERROR_NOTIFY_ENUM_DIR` now trigger a rescan instead of losing the events
+- HDR float-to-half conversion now rounds to nearest instead of truncating, and NaN pixels are clamped to 0 instead of becoming infinity
+- The alpha channel is no longer scaled along with luminance
+- The single-instance lock is now per user, so two signed-in users can each run the app. A user still gets only one instance across sessions, and the app won't start while v1.1.2 or older is still running.
 
 ## ✨ Improvements
 
-### Log rotation (500-line cap)
 
-`log.txt` previously grew unbounded. Now on each startup, if the log exceeds 500 lines, it's trimmed to the most recent 500.
+- The log is written as UTF-8 and is thread-safe, so non-ASCII paths (such as a Cyrillic user name) and localized Windows error messages are logged correctly
+- "System busy" is logged once per busy period instead of every 30 seconds
+- More JPEG XR HDR pixel formats (fixed-point, RGBE) are recognised. Before, these took the SDR path and the HDR data was thrown away. If WIC can't convert one, the JXR is now kept untouched.
+- `--convert` output now appears in the terminal that launched it, Unicode paths included
+- The startup registry entry is quoted, so paths with spaces are handled safely
 
 ## 📦 Upgrade Instructions
 
-**Existing users**: Simply run `JxrAutoCleaner-v1.1.1.msi` — it will automatically upgrade in-place.
+**Existing users**: exit the old version from the tray first, then run `JxrAutoCleaner-v1.1.3.msi`. It upgrades the existing install in place. If the old version is still running, v1.1.3 exits at launch instead of running alongside it.
 
 ---
 
-**Full Changelog**: [v1.1...v1.1.1](https://github.com/ThatHunky/jxr-auto-cleaner/compare/v1.1...v1.1.1)
+**Full Changelog**: [v1.1.2...v1.1.3](https://github.com/ThatHunky/jxr-auto-cleaner/compare/v1.1.2...v1.1.3)

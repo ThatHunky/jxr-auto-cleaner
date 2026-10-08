@@ -16,4 +16,9 @@ public:
            HANDLE shutdownEvent);
 };
 
+/// Recursively queues every .jxr under `dir` that has no sibling .jpg yet.
+/// Unreadable folders are skipped. Returns the number of files queued.
+size_t QueueUnconvertedJxrFiles(const std::wstring &dir,
+                                ThreadSafeQueue<std::wstring> &queue);
+
 } // namespace jxr

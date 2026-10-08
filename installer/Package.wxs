@@ -4,7 +4,7 @@
   
   <Package Name="JxrAutoCleaner"
            Manufacturer="ThatHunky"
-           Version="1.1.1.0"
+           Version="1.1.3.0"
            UpgradeCode="779AB028-26D7-496F-A037-94BC1781E728"
            Scope="perUser">
 
@@ -55,7 +55,7 @@
                          Key="Software\Microsoft\Windows\CurrentVersion\Run"
                          Name="JxrAutoCleaner"
                          Type="string"
-                         Value="[INSTALLFOLDER]JxrAutoCleaner.exe" />
+                         Value="&quot;[INSTALLFOLDER]JxrAutoCleaner.exe&quot;" />
         </Component>
       </Directory>
     </StandardDirectory>

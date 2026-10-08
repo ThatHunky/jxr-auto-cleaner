@@ -21,7 +21,7 @@ High Dynamic Range (HDR) screenshots taken via NVIDIA ShadowPlay are saved in th
 
 ## Usage
 
-1. **Install**: Run the `JxrAutoCleaner-v1.1.1.msi` installer. It will install to your local AppData folder and register itself to run at startup.
+1. **Install**: Run the `JxrAutoCleaner-v1.1.3.msi` installer. It will install to your local AppData folder and register itself to run at startup.
 2. **Setup**: By default, it monitors your Windows "Videos" library (where ShadowPlay typically saves screenshots).
 3. **Tray Icon**: Look for the icon in your system tray. Right-click it to:
    - **Force Run Now**: Manually trigger a scan of your folders.
@@ -33,15 +33,17 @@ High Dynamic Range (HDR) screenshots taken via NVIDIA ShadowPlay are saved in th
 You can also use the service as a CLI tool for manual conversions:
 
 ```powershell
-.\JxrAutoCleaner.exe --convert "C:\Path\To\Screenshot.jxr"
+.\JxrAutoCleaner.exe --convert "C:\Path\To\Screenshot.jxr" | Out-Default
 ```
+
+It's a GUI-subsystem app, so the shell doesn't wait for it by default. Piping (as above) or `start /wait` in `cmd` makes it wait, so the output and exit code come back in order.
 
 ## Build Instructions
 
 Requirements:
 
 - Windows 10/11
-- Visual Studio 2022 (with C++ Desktop development)
+- Visual Studio 2026 (with C++ Desktop development; `setup.bat` uses the "Visual Studio 18 2026" generator)
 - CMake 3.20+
 - WiX Toolset v4+ (for building the installer)
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(JxrAutoCleaner VERSION 1.1.1 LANGUAGES CXX)
+project(JxrAutoCleaner VERSION 1.1.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,6 +35,7 @@ target_link_libraries(JxrAutoCleaner PRIVATE
     ole32
     shlwapi
     shell32
+    advapi32
 )
 
 # For ComPtr

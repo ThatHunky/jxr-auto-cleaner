@@ -119,8 +119,8 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 ┌──────────────────────────────────────────────────────────────┐
 │ 6. Atomic File Replacement                                  │
 │    • Write to "original.tmp.jpg"                            │
-│    • Delete "original.jxr" (with retry for locks)           │
 │    • Rename "original.tmp.jpg" → "original.jpg"             │
+│    • Delete "original.jxr" (kept if locked)                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -158,7 +158,8 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 - **Handles**:
   - `WM_TRAYICON` — Tray icon events (right-click menu)
   - `WM_COMMAND` — Menu selections (Force Run, Toggle Startup, Exit)
-  - `WM_ENDSESSION` — Windows shutdown/logoff
+  - `WM_ENDSESSION` — Windows shutdown/logoff (threads are stopped inside the handler)
+  - `TaskbarCreated` — Explorer restarted; re-adds the tray icon
   - `WM_CLOSE` / `WM_DESTROY` — Application exit
 
 ### Watcher Thread
@@ -167,10 +168,10 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 - **API**: `ReadDirectoryChangesW` with `FILE_FLAG_OVERLAPPED`
 - **Behavior**:
   - Recursive monitoring (`bWatchSubtree = TRUE`)
-  - Filters: `FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE`
+  - Filter: `FILE_NOTIFY_CHANGE_FILE_NAME` (only adds/renames matter)
   - On new `.jxr` detected → push full path to `g_queue`
   - Waits on `{hEvent, g_shutdownEvent}` to handle both file changes and shutdown
-- **Buffer Overflow Handling**: If too many changes occur at once, performs a full directory scan
+- **Buffer Overflow Handling**: If too many changes occur at once (`ERROR_NOTIFY_ENUM_DIR` or 0 bytes returned), performs a full directory scan
 
 ### Worker Thread
 
@@ -178,7 +179,7 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 - **Flow**:
   1. `g_queue.wait_and_pop(30s)` — blocks until a file is available
   2. **Idle Check**: `IsSystemBusy()` — checks gaming state and CPU load
-     - If busy → re-queue file, sleep 30s, retry
+     - If busy → re-queue file, sleep 30s, retry (logged once per busy period)
   3. **File Lock Check**: Attempts exclusive `CreateFileW` with retries (ShadowPlay may still be writing)
   4. **Conversion**: `ConvertJxrToUltraHdrJpeg(filePath)`
   5. Repeat until `g_shutdownEvent` is signaled
@@ -206,7 +207,8 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 
 - **API**: `Shell_NotifyIconW` with `NOTIFYICON_VERSION_4`
 - **Icon**: Loaded from embedded resource (`IDI_ICON1`)
-- **Tooltip**: "JxrAutoCleaner v1.0"
+- **Tooltip**: "JxrAutoCleaner v1.1.3"
+- **Explorer restarts**: the hidden window handles the `TaskbarCreated` broadcast and re-adds the icon
 - **Context Menu**:
   - **Force Run Now** → `ForceScanNow()` — scans Videos folder, queues all unconverted `.jxr` files
   - **Toggle Startup** → `AddToStartup()` / `RemoveFromStartup()`
@@ -219,21 +221,22 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 ```cpp
 QUERY_USER_NOTIFICATION_STATE state;
 SHQueryUserNotificationState(&state);
-bool isGaming = (state == QUNS_BUSY ||
-                 state == QUNS_RUNNING_D3D_FULL_SCREEN ||
+// QUNS_BUSY is deliberately excluded: Focus Assist / Do Not Disturb also
+// report it, which made the app think you were always gaming.
+bool isGaming = (state == QUNS_RUNNING_D3D_FULL_SCREEN ||
                  state == QUNS_PRESENTATION_MODE);
 ```
 
 **CPU Load Sampling**:
 
 ```cpp
-GetSystemTimes(&idleA, &kernelA, &userA);
-Sleep(1000); // 1-second sample window
-GetSystemTimes(&idleB, &kernelB, &userB);
-double cpuPercent = (1.0 - (double)idle / (double)total) * 100.0;
+// Non-blocking: compares against the previous call's GetSystemTimes()
+// snapshot, re-sampling at most once per second (GetTickCount64).
+GetSystemTimes(&idle, &kernel, &user);
+double cpuPercent = (1.0 - (double)idleDiff / (double)totalDiff) * 100.0;
 ```
 
-**Threshold**: Conversion is deferred if CPU > 25% or gaming is detected.
+**Threshold**: Conversion is deferred if CPU > 25% or gaming is detected. **Force Run Now** bypasses this check and wakes the worker immediately.
 
 ---
 
@@ -243,11 +246,13 @@ double cpuPercent = (1.0 - (double)idle / (double)total) * 100.0;
 
 To prevent data loss or corruption:
 
-1. **Write to Temp**: `original.tmp.jpg`
-2. **Delete Original**: `fs::remove(original.jxr)`
+1. **Write to Temp**: `original.tmp.jpg` (write errors such as disk full delete the temp and keep the original)
+2. **Rename Temp**: `fs::rename(original.tmp.jpg, original.jpg)`
+   - If this fails → delete the temp, keep the original
+3. **Delete Original**: `fs::remove(original.jxr)`
    - If locked → log warning, keep both files
-   - Retry logic for transient locks
-3. **Rename Temp**: `fs::rename(original.tmp.jpg, original.jpg)`
+
+The rename happens before the delete so there is no moment where neither a finished `.jpg` nor the original `.jxr` exists.
 
 ### File Lock Handling
 
@@ -271,7 +276,11 @@ for (int retry = 0; retry < 5; ++retry) {
 
 ### Orphan Cleanup
 
-On startup, scans for leftover `.tmp.jpg` files from previous crashes and deletes them.
+When the worker thread starts, before it converts anything, it scans for leftover `.tmp.jpg` files from previous crashes. The worker is the only writer of temp files, so none can be mid-write at that point.
+
+- If the matching `.jxr` still exists, the temp file is a partial write and is deleted.
+- If the `.jxr` is gone, the temp file ends with the JPEG EOI marker (`FF D9`), and no `.jpg` exists, it is the finished output left by pre-1.1.3 versions (which deleted before renaming). It is renamed to `.jpg` instead of being thrown away.
+- In every other case (truncated, name taken, or the existence check errored), the file is left alone and logged.
 
 ---
 
@@ -363,7 +372,9 @@ target_link_libraries(JxrAutoCleaner PRIVATE
 
 - **Location**: `%LOCALAPPDATA%\JxrAutoCleaner\log.txt`
 - **Format**: `[YYYY-MM-DD HH:MM:SS] message`
-- **Thread-safe**: Uses file append mode with per-call `fopen`/`fclose`
+- **Thread-safe**: Writes are serialized by a mutex, per-call `fopen`/`fclose` in append mode
+- **Encoding**: UTF-8 (non-ASCII paths such as Cyrillic user names log correctly)
+- **Rotation**: Trimmed to the last 500 lines on startup (temp file + atomic replace)
 
 ### Known Edge Cases
 
@@ -371,6 +382,7 @@ target_link_libraries(JxrAutoCleaner PRIVATE
 | -------------------------------------- | ----------------------------------------- |
 | **File locked by ShadowPlay**          | Retry 5 times with 2s delay, then skip    |
 | **Disk full during write**             | Temp file write fails, original preserved |
+| **HDR format WIC can't convert**       | Logs error, keeps the JXR untouched       |
 | **Corrupt JXR**                        | WIC decode fails, logs error, skips file  |
 | **Non-HDR JXR**                        | Falls back to simple WIC JPEG transcode   |
 | **Buffer overflow (too many changes)** | Fallback to full directory scan           |

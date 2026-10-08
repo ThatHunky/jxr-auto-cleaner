@@ -6,7 +6,8 @@ namespace jxr {
 /// active.
 bool IsGaming();
 
-/// Samples CPU usage over ~1 second. Returns percentage [0..100].
+/// CPU usage since the previous call (non-blocking; re-sampled at most once a
+/// second, the first call returns 0). Returns percentage [0..100].
 double GetCpuUsagePercent();
 
 /// Returns true if the system is considered busy (gaming + CPU > threshold).

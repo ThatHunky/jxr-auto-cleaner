@@ -1,24 +1,32 @@
 #include "FileWatcher.h"
 #include "Utils.h"
-#include <algorithm>
-#include <cctype>
+#include <cstdint>
 #include <filesystem>
+#include <vector>
 
 namespace fs = std::filesystem;
 
 namespace jxr {
 
 // ============================================================================
-// Case-insensitive extension check
+// Full scan (used for buffer overflow and "Force Run Now")
 // ============================================================================
-static bool HasJxrExtension(const std::wstring &filename) {
-  if (filename.size() < 4)
-    return false;
-  std::wstring ext = filename.substr(filename.size() - 4);
-  // Convert to lowercase
-  std::transform(ext.begin(), ext.end(), ext.begin(),
-                 [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
-  return ext == L".jxr";
+size_t QueueUnconvertedJxrFiles(const std::wstring &dir,
+                                ThreadSafeQueue<std::wstring> &queue) {
+  size_t count = 0;
+  ForEachFile(dir, [&](const fs::path &path) {
+    if (!HasExtension(path, L".jxr"))
+      return;
+    // Skip if a .jpg already exists (already converted)
+    fs::path jpgPath = path;
+    jpgPath.replace_extension(L".jpg");
+    std::error_code ec;
+    if (fs::exists(jpgPath, ec))
+      return;
+    queue.push(path.wstring());
+    ++count;
+  });
+  return count;
 }
 
 // ============================================================================
@@ -57,15 +65,26 @@ void FileWatcher::Run(const std::wstring &watchDir,
   constexpr DWORD BUF_SIZE = 64 * 1024; // 64 KB
   std::vector<uint8_t> buffer(BUF_SIZE);
 
+  OVERLAPPED overlapped = {};
+
+  // Cancel an in-flight read and wait for it to finish, so the kernel can't
+  // write into `overlapped` or `buffer` after we leave Run().
+  auto cancelPendingRead = [&] {
+    if (::CancelIoEx(hDir, &overlapped) ||
+        ::GetLastError() != ERROR_NOT_FOUND) {
+      DWORD ignored = 0;
+      ::GetOverlappedResult(hDir, &overlapped, &ignored, TRUE);
+    }
+  };
+
   while (true) {
-    OVERLAPPED overlapped = {};
+    overlapped = {};
     overlapped.hEvent = hEvent;
     ::ResetEvent(hEvent);
 
     BOOL success = ::ReadDirectoryChangesW(hDir, buffer.data(), BUF_SIZE,
                                            TRUE, // Watch subtree
-                                           FILE_NOTIFY_CHANGE_FILE_NAME |
-                                               FILE_NOTIFY_CHANGE_LAST_WRITE,
+                                           FILE_NOTIFY_CHANGE_FILE_NAME,
                                            nullptr, &overlapped, nullptr);
 
     if (!success) {
@@ -83,7 +102,7 @@ void FileWatcher::Run(const std::wstring &watchDir,
 
     if (waitResult == WAIT_OBJECT_0 + 1) {
       // Shutdown signaled
-      ::CancelIoEx(hDir, &overlapped);
+      cancelPendingRead();
       LogMsg(L"FileWatcher: shutdown signaled, exiting");
       break;
     }
@@ -91,31 +110,24 @@ void FileWatcher::Run(const std::wstring &watchDir,
     if (waitResult == WAIT_OBJECT_0) {
       // Directory change occurred
       DWORD bytesReturned = 0;
+      bool overflow = false;
       if (!::GetOverlappedResult(hDir, &overlapped, &bytesReturned, FALSE)) {
-        LogMsg(L"FileWatcher: GetOverlappedResult failed, error %u",
-               ::GetLastError());
-        continue;
+        DWORD err = ::GetLastError();
+        if (err != ERROR_NOTIFY_ENUM_DIR) {
+          LogMsg(L"FileWatcher: GetOverlappedResult failed, error %u", err);
+          continue;
+        }
+        overflow = true;
+      } else if (bytesReturned == 0) {
+        overflow = true;
       }
 
-      if (bytesReturned == 0) {
-        // Buffer overflow — too many changes at once. Scan directory manually.
+      if (overflow) {
+        // Too many changes at once; the events were dropped. Rescan instead.
         LogMsg(
             L"FileWatcher: buffer overflow, scanning directory for .jxr files");
-        try {
-          for (const auto &entry : fs::recursive_directory_iterator(watchDir)) {
-            if (entry.is_regular_file() &&
-                HasJxrExtension(entry.path().wstring())) {
-              // Skip if a .jpg already exists (already converted)
-              fs::path jpgPath = entry.path();
-              jpgPath.replace_extension(L".jpg");
-              if (fs::exists(jpgPath))
-                continue;
-              queue.push(entry.path().wstring());
-            }
-          }
-        } catch (const std::exception &e) {
-          LogMsg(L"FileWatcher: scan error: %hs", e.what());
-        }
+        size_t queued = QueueUnconvertedJxrFiles(watchDir, queue);
+        LogMsg(L"FileWatcher: overflow scan queued %zu files", queued);
         continue;
       }
 
@@ -130,7 +142,7 @@ void FileWatcher::Run(const std::wstring &watchDir,
           std::wstring filename(info->FileName,
                                 info->FileNameLength / sizeof(wchar_t));
 
-          if (HasJxrExtension(filename)) {
+          if (HasExtension(fs::path(filename), L".jxr")) {
             // Build full path
             std::wstring fullPath = watchDir + L"\\" + filename;
             LogMsg(L"FileWatcher: detected JXR: %s", fullPath.c_str());
@@ -145,6 +157,7 @@ void FileWatcher::Run(const std::wstring &watchDir,
     } else {
       // Unexpected wait result
       LogMsg(L"FileWatcher: unexpected wait result %u", waitResult);
+      cancelPendingRead();
       break;
     }
   }
