@@ -1,0 +1,66 @@
+name: Build
+
+# PRs and master pushes: build the exe + MSI (catches MSVC/WiX breakage).
+# A v* tag: also publish a GitHub release with the MSI and RELEASE_NOTES.md.
+on:
+  pull_request:
+  push:
+    branches: [master]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Read version from CMakeLists.txt
+        id: version
+        shell: pwsh
+        run: |
+          $m = Select-String -Path CMakeLists.txt -Pattern 'project\(JxrAutoCleaner VERSION (\d+\.\d+\.\d+)'
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "Tag $env:GITHUB_REF_NAME doesn't match CMakeLists.txt version $v"
+          }
+
+      - name: Configure
+        run: cmake -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 6.0.2
+          # WiX 6 refuses to build until its EULA is accepted (same as a local
+          # setup.bat build). Extensions come from the repo's .wix/ cache.
+          wix eula accept wix6
+
+      - name: Build MSI
+        run: >
+          wix build installer\Package.wxs -d BuildOutput=build\Release
+          -o build\JxrAutoCleaner-v${{ steps.version.outputs.version }}.msi
+          -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JxrAutoCleaner-v${{ steps.version.outputs.version }}
+          path: |
+            build/Release/JxrAutoCleaner.exe
+            build/JxrAutoCleaner-v${{ steps.version.outputs.version }}.msi
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: JxrAutoCleaner ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: build/JxrAutoCleaner-v${{ steps.version.outputs.version }}.msi
