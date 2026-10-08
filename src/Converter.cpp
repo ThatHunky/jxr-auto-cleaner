@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -59,30 +60,37 @@ static inline float HalfToFloat(uint16_t h) {
   return f;
 }
 
+// Round-to-nearest-even float -> half (after F. Giesen's float_to_half_fast3).
+// The old truncating version biased values downward and turned NaN into Inf.
 static inline uint16_t FloatToHalf(float value) {
+  constexpr uint32_t kF32Infinity = 255u << 23;
+  constexpr uint32_t kF16Overflow = (127u + 16u) << 23; // first value >= 65520
+  constexpr uint32_t kDenormMagic = ((127u - 15u) + (23u - 10u) + 1u) << 23;
+
   uint32_t bits;
   std::memcpy(&bits, &value, 4);
+  const uint32_t sign = bits & 0x80000000u;
+  bits ^= sign;
 
-  uint32_t sign = (bits >> 16) & 0x8000;
-  int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
-  uint32_t mantissa = bits & 0x007FFFFFu;
-
-  if (exponent <= 0) {
-    if (exponent < -10)
-      return static_cast<uint16_t>(sign); // Too small, flush to ±0
-    // Subnormal
-    mantissa |= 0x00800000u;
-    uint32_t shift = static_cast<uint32_t>(1 - exponent);
-    mantissa >>= shift;
-    return static_cast<uint16_t>(sign | (mantissa >> 13));
-  } else if (exponent >= 31) {
-    // Overflow → Inf, or NaN passthrough
-    if (exponent == 31 && mantissa != 0)
-      return static_cast<uint16_t>(sign | 0x7C00 | (mantissa >> 13)); // NaN
-    return static_cast<uint16_t>(sign | 0x7C00);                      // ±Inf
+  uint16_t out;
+  if (bits >= kF16Overflow) {
+    out = (bits > kF32Infinity) ? 0x7E00 : 0x7C00; // NaN : Inf
+  } else if (bits < (113u << 23)) {
+    // Result is a half subnormal (or zero): let the FPU do the rounding.
+    float f, magic;
+    std::memcpy(&f, &bits, 4);
+    std::memcpy(&magic, &kDenormMagic, 4);
+    f += magic;
+    uint32_t r;
+    std::memcpy(&r, &f, 4);
+    out = static_cast<uint16_t>(r - kDenormMagic);
+  } else {
+    const uint32_t mantissaOdd = (bits >> 13) & 1u;
+    bits += ((15u - 127u) << 23) + 0xFFFu; // rebias exponent, round half up
+    bits += mantissaOdd;                    // ...but ties go to even
+    out = static_cast<uint16_t>(bits >> 13);
   }
-
-  return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+  return static_cast<uint16_t>(out | (sign >> 16));
 }
 
 namespace jxr {
@@ -93,9 +101,44 @@ namespace jxr {
 static bool IsHdrPixelFormat(const WICPixelFormatGUID &fmt) {
   return IsEqualGUID(fmt, GUID_WICPixelFormat64bppRGBAHalf) ||
          IsEqualGUID(fmt, GUID_WICPixelFormat128bppRGBAFloat) ||
+         IsEqualGUID(fmt, GUID_WICPixelFormat128bppPRGBAFloat) ||
          IsEqualGUID(fmt, GUID_WICPixelFormat128bppRGBFloat) ||
          IsEqualGUID(fmt, GUID_WICPixelFormat48bppRGBHalf) ||
-         IsEqualGUID(fmt, GUID_WICPixelFormat64bppRGBHalf);
+         IsEqualGUID(fmt, GUID_WICPixelFormat64bppRGBHalf) ||
+         // JPEG XR fixed-point / shared-exponent variants are scRGB too
+         IsEqualGUID(fmt, GUID_WICPixelFormat48bppRGBFixedPoint) ||
+         IsEqualGUID(fmt, GUID_WICPixelFormat64bppRGBFixedPoint) ||
+         IsEqualGUID(fmt, GUID_WICPixelFormat64bppRGBAFixedPoint) ||
+         IsEqualGUID(fmt, GUID_WICPixelFormat128bppRGBFixedPoint) ||
+         IsEqualGUID(fmt, GUID_WICPixelFormat128bppRGBAFixedPoint) ||
+         IsEqualGUID(fmt, GUID_WICPixelFormat32bppRGBE);
+}
+
+// ============================================================================
+// Helper: move the finished temp output into place, then delete the source.
+// Renaming first means a failure at any step leaves the original JXR intact.
+// ============================================================================
+static bool FinalizeOutput(const fs::path &tempPath, const fs::path &finalPath,
+                           const fs::path &inputPath) {
+  std::error_code ec;
+  fs::rename(tempPath, finalPath, ec);
+  if (ec) {
+    LogMsg(L"Failed to rename temp file to final: %hs", ec.message().c_str());
+    fs::remove(tempPath, ec);
+    return false;
+  }
+
+  fs::remove(inputPath, ec);
+  if (ec) {
+    LogMsg(L"Could not delete original JXR (locked?): %hs — keeping both "
+           L"files",
+           ec.message().c_str());
+  }
+
+  const uintmax_t size = fs::file_size(finalPath, ec);
+  LogMsg(L"Conversion complete: %s (%.1f KB)", finalPath.wstring().c_str(),
+         ec ? 0.0 : static_cast<double>(size) / 1024.0);
+  return true;
 }
 
 // ============================================================================
@@ -224,34 +267,32 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
   }
 
   // Check pixel format
-  WICPixelFormatGUID pixFmt;
-  frame->GetPixelFormat(&pixFmt);
+  WICPixelFormatGUID pixFmt = GUID_WICPixelFormatUndefined;
+  hr = frame->GetPixelFormat(&pixFmt);
+  if (FAILED(hr)) {
+    LogMsg(L"Failed to read pixel format: 0x%08X", hr);
+    return false;
+  }
 
-  // If SDR (8-bit), do a simple transcode without libultrahdr
-  if (!IsHdrPixelFormat(pixFmt)) {
-    LogMsg(L"SDR pixel format detected, performing simple JPEG transcode");
+  // Simple WIC transcode for SDR sources (and HDR formats WIC can't convert
+  // to half float). Releases the WIC objects so the source can be deleted.
+  auto transcodeSdr = [&]() {
     bool ok =
         TranscodeSdrJxrToJpeg(factory, frame, tempPath.wstring(), jpegQuality);
-    // Release all WIC COM objects to unlock the source file
     frame.Reset();
     decoder.Reset();
     factory.Reset();
-    if (ok) {
+    if (!ok) {
       std::error_code ec;
-      fs::remove(inputPath, ec);
-      if (ec) {
-        LogMsg(L"Could not delete original JXR (locked?): %hs — keeping both "
-               L"files",
-               ec.message().c_str());
-      }
-      fs::rename(tempPath, finalPath, ec);
-      if (ec) {
-        LogMsg(L"File replace failed: %hs", ec.message().c_str());
-        return false;
-      }
-      LogMsg(L"SDR conversion complete: %s", finalPath.wstring().c_str());
+      fs::remove(tempPath, ec);
+      return false;
     }
-    return ok;
+    return FinalizeOutput(tempPath, finalPath, inputPath);
+  };
+
+  if (!IsHdrPixelFormat(pixFmt)) {
+    LogMsg(L"SDR pixel format detected, performing simple JPEG transcode");
+    return transcodeSdr();
   }
 
   // --- HDR path: convert to half-float RGBA ---
@@ -269,8 +310,11 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
                              WICBitmapDitherTypeNone, nullptr, 0.0,
                              WICBitmapPaletteTypeCustom);
   if (FAILED(hr)) {
-    LogMsg(L"HDR format conversion failed: 0x%08X", hr);
-    return false;
+    LogMsg(L"HDR format conversion failed: 0x%08X, falling back to SDR "
+           L"transcode",
+           hr);
+    converter.Reset();
+    return transcodeSdr();
   }
 
   UINT width, height;
@@ -294,16 +338,20 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
   // libultrahdr's 64bppRGBAHalfFloat expects 1.0 = 203 nits (BT.2408).
   // Scale factor: 80.0 / 203.0 maps scRGB 1.0 → 0.3941 (which the library
   // correctly interprets as 80 nits, since 0.3941 × 203 ≈ 80).
+  // Only RGB is scaled; alpha is coverage, not luminance.
   {
     constexpr float kScRGBToUhdr = 80.0f / 203.0f;
     auto *pixels = reinterpret_cast<uint16_t *>(hdrPixels.data());
-    const size_t totalComponents = static_cast<size_t>(width) * height * 4;
-    for (size_t i = 0; i < totalComponents; ++i) {
-      float val = HalfToFloat(pixels[i]);
-      val *= kScRGBToUhdr;
-      if (val < 0.0f)
-        val = 0.0f; // Clamp negatives (out-of-gamut; invalid for Ultra HDR)
-      pixels[i] = FloatToHalf(val);
+    const size_t totalPixels = static_cast<size_t>(width) * height;
+    for (size_t p = 0; p < totalPixels; ++p) {
+      uint16_t *rgb = pixels + p * 4;
+      for (int c = 0; c < 3; ++c) {
+        float val = HalfToFloat(rgb[c]) * kScRGBToUhdr;
+        // Clamp negatives (out-of-gamut; invalid for Ultra HDR) and NaN.
+        if (!(val > 0.0f))
+          val = 0.0f;
+        rgb[c] = FloatToHalf(val);
+      }
     }
   }
 
@@ -403,8 +451,17 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
       return false;
     }
     outFile.write(reinterpret_cast<const char *>(output->data),
-                  output->data_sz);
+                  static_cast<std::streamsize>(output->data_sz));
     outFile.close();
+    if (!outFile) {
+      // e.g. disk full: never promote a truncated JPEG over the original
+      LogMsg(L"Failed to write temp output file: %s",
+             tempPath.wstring().c_str());
+      uhdr_release_encoder(enc);
+      std::error_code ec;
+      fs::remove(tempPath, ec);
+      return false;
+    }
   }
 
   uhdr_release_encoder(enc);
@@ -415,33 +472,7 @@ bool ConvertJxrToUltraHdrJpeg(const std::wstring &jxrPath, int jpegQuality) {
   decoder.Reset();
   factory.Reset();
 
-  // --- Atomic replace ---
-  std::error_code ec;
-  fs::remove(inputPath, ec);
-  if (ec) {
-    LogMsg(L"Could not delete original JXR (locked?): %hs — keeping both files",
-           ec.message().c_str());
-    // Still rename the temp to final so the conversion output is usable
-    fs::rename(tempPath, finalPath, ec);
-    if (ec) {
-      LogMsg(L"Failed to rename temp file to final: %hs", ec.message().c_str());
-      return false;
-    }
-    LogMsg(L"HDR conversion complete (original kept): %s (%.1f KB)",
-           finalPath.wstring().c_str(),
-           static_cast<double>(fs::file_size(finalPath)) / 1024.0);
-    return true;
-  }
-
-  fs::rename(tempPath, finalPath, ec);
-  if (ec) {
-    LogMsg(L"Failed to rename temp file to final: %hs", ec.message().c_str());
-    return false;
-  }
-
-  LogMsg(L"HDR conversion complete: %s (%.1f KB)", finalPath.wstring().c_str(),
-         static_cast<double>(fs::file_size(finalPath)) / 1024.0);
-  return true;
+  return FinalizeOutput(tempPath, finalPath, inputPath);
 }
 
 } // namespace jxr

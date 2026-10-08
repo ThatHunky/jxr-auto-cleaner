@@ -47,16 +47,19 @@ static bool IsInStartup() {
 
 static void AddToStartup() {
   wchar_t exePath[MAX_PATH];
-  ::GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+  if (!::GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+    return;
+  // Quoted, so a space in the profile path can't be split by CreateProcess
+  const std::wstring command = L"\"" + std::wstring(exePath) + L"\"";
 
   HKEY hKey = nullptr;
   if (::RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_SET_VALUE,
                       &hKey) == ERROR_SUCCESS) {
-    DWORD len = static_cast<DWORD>((wcslen(exePath) + 1) * sizeof(wchar_t));
+    DWORD len = static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
     ::RegSetValueExW(hKey, kAppName, 0, REG_SZ,
-                     reinterpret_cast<const BYTE *>(exePath), len);
+                     reinterpret_cast<const BYTE *>(command.c_str()), len);
     ::RegCloseKey(hKey);
-    LogMsg(L"Added to startup: %s", exePath);
+    LogMsg(L"Added to startup: %s", command.c_str());
   }
 }
 
@@ -75,29 +78,40 @@ static void RemoveFromStartup() {
 // ============================================================================
 static void ForceScanNow() {
   LogMsg(L"Force scan requested");
-  int count = 0;
-  try {
-    for (const auto &entry : fs::recursive_directory_iterator(g_videosDir)) {
-      if (!entry.is_regular_file())
-        continue;
-      auto ext = entry.path().extension().wstring();
-      std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) {
-        return static_cast<wchar_t>(::towlower(c));
-      });
-      if (ext == L".jxr") {
-        // Skip if already converted
-        fs::path jpgPath = entry.path();
-        jpgPath.replace_extension(L".jpg");
-        if (fs::exists(jpgPath))
-          continue;
-        g_queue.push(entry.path().wstring());
-        ++count;
-      }
+  size_t count = QueueUnconvertedJxrFiles(g_videosDir, g_queue);
+  LogMsg(L"Force scan: queued %zu files", count);
+}
+
+// ============================================================================
+// Startup: deal with "<name>.tmp.jpg" files left by a crash mid-conversion
+// ============================================================================
+static void CleanUpOrphanTempFiles(const std::wstring &dir) {
+  std::error_code ec;
+  fs::recursive_directory_iterator it(
+      dir, fs::directory_options::skip_permission_denied, ec);
+  for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    const fs::path &tmp = it->path();
+    std::error_code fileEc;
+    if (!it->is_regular_file(fileEc) || !HasExtension(tmp, L".jpg") ||
+        !HasExtension(tmp.stem(), L".tmp"))
+      continue;
+
+    fs::path jxr = tmp.parent_path() / tmp.stem();
+    jxr.replace_extension(L".jxr");
+    fs::path jpg = jxr;
+    jpg.replace_extension(L".jpg");
+
+    if (fs::exists(jxr, fileEc)) {
+      // The source survived, so the temp file is a partial write: drop it.
+      LogMsg(L"Removing partial temp file: %s", tmp.wstring().c_str());
+      fs::remove(tmp, fileEc);
+    } else if (!fs::exists(jpg, fileEc)) {
+      // Versions before 1.1.2 deleted the JXR before renaming the finished
+      // temp file, so this may be the only copy left. Recover it.
+      LogMsg(L"Recovering orphan temp file: %s", tmp.wstring().c_str());
+      fs::rename(tmp, jpg, fileEc);
     }
-  } catch (const std::exception &e) {
-    LogMsg(L"Force scan error: %hs", e.what());
   }
-  LogMsg(L"Force scan: queued %d files", count);
 }
 
 // ============================================================================
@@ -111,7 +125,7 @@ static void CreateTrayIcon(HWND hwnd) {
   g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
   g_nid.uCallbackMessage = WM_TRAYICON;
   g_nid.hIcon = ::LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1));
-  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1.1");
+  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1.2");
 
   ::Shell_NotifyIconW(NIM_ADD, &g_nid);
 
@@ -164,6 +178,7 @@ static void WorkerThread() {
 
   LogMsg(L"Worker: started");
   constexpr int MAX_RETRIES = 5;
+  bool wasBusy = false;
 
   while (::WaitForSingleObject(g_shutdownEvent, 0) != WAIT_OBJECT_0) {
     // Wait for a file to appear in the queue (30 second timeout)
@@ -173,11 +188,19 @@ static void WorkerThread() {
 
     // Check if system is busy
     if (IsSystemBusy()) {
-      LogMsg(L"Worker: system busy, re-queuing %s", item->c_str());
+      // Log only the transition; this re-checks every ~30s while busy.
+      if (!wasBusy)
+        LogMsg(L"Worker: system busy, deferring %zu file(s)",
+               g_queue.size() + 1);
+      wasBusy = true;
       g_queue.push_front(std::move(*item));
       if (::WaitForSingleObject(g_shutdownEvent, 30000) == WAIT_OBJECT_0)
         break;
       continue;
+    }
+    if (wasBusy) {
+      LogMsg(L"Worker: system idle, resuming");
+      wasBusy = false;
     }
 
     std::wstring filePath = std::move(*item);
@@ -201,7 +224,7 @@ static void WorkerThread() {
         LogMsg(L"Worker: file locked (attempt %d/%d): %s", retry + 1,
                MAX_RETRIES, filePath.c_str());
         if (::WaitForSingleObject(g_shutdownEvent, 2000) == WAIT_OBJECT_0)
-          break;
+          break; // fileReady stays false; shutdown check below exits quietly
       } else if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
         LogMsg(L"Worker: file no longer exists: %s", filePath.c_str());
         break;
@@ -212,13 +235,17 @@ static void WorkerThread() {
       }
     }
 
+    if (::WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
+      break;
+
     if (!fileReady) {
       LogMsg(L"Worker: skipping file (not accessible): %s", filePath.c_str());
       continue;
     }
 
     // Check if file still exists
-    if (!fs::exists(filePath)) {
+    std::error_code ec;
+    if (!fs::exists(filePath, ec)) {
       LogMsg(L"Worker: file disappeared before conversion: %s",
              filePath.c_str());
       continue;
@@ -247,6 +274,14 @@ static void WatcherThread(const std::wstring &videosDir) {
 // ============================================================================
 static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wp,
                                       LPARAM lp) {
+  // Broadcast by Explorer when the taskbar is (re)created, e.g. after a crash.
+  static const UINT s_taskbarCreated =
+      ::RegisterWindowMessageW(L"TaskbarCreated");
+  if (msg == s_taskbarCreated && msg != 0) {
+    CreateTrayIcon(hwnd);
+    return 0;
+  }
+
   switch (msg) {
   case WM_TRAYICON:
     // NOTIFYICON_VERSION_4: LOWORD(lp) = event, HIWORD(lp) = icon id
@@ -279,10 +314,16 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wp,
     break;
 
   case WM_ENDSESSION:
+    // wParam == FALSE means the session end was cancelled; keep running.
+    if (!wp)
+      return 0;
+    [[fallthrough]];
   case WM_CLOSE:
     RemoveTrayIcon();
     if (g_shutdownEvent)
       ::SetEvent(g_shutdownEvent);
+    // Leave the message loop so wWinMain runs the shutdown sequence.
+    ::PostQuitMessage(0);
     return 0;
 
   case WM_DESTROY:
@@ -296,6 +337,14 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wp,
 // CLI mode: --convert <file>
 // ============================================================================
 static int RunCliConvert(const std::wstring &filePath) {
+  // This is a WIN32-subsystem exe, so stdout/stderr go nowhere unless we
+  // attach to the console of the shell that launched us.
+  if (::AttachConsole(ATTACH_PARENT_PROCESS)) {
+    FILE *ignored = nullptr;
+    freopen_s(&ignored, "CONOUT$", "w", stdout);
+    freopen_s(&ignored, "CONOUT$", "w", stderr);
+  }
+
   ComInit com;
   if (!com) {
     fwprintf(stderr, L"COM initialization failed\n");
@@ -317,7 +366,7 @@ static int RunCliConvert(const std::wstring &filePath) {
 // ============================================================================
 // Entry point
 // ============================================================================
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   g_hInstance = hInstance;
 
   // Parse command line for --convert mode
@@ -336,17 +385,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
   }
 
   // --- Background service mode ---
-  TrimLog();
-  LogMsg(L"=== JxrAutoCleaner starting ===");
-
   // Single-instance check
-  HANDLE hMutex = ::CreateMutexW(nullptr, TRUE, L"Global\\JxrAutoCleanerMutex");
+  // Per-session (Local) mutex: a Global one would stop a second signed-in
+  // user from running their own instance for their own Videos folder.
+  HANDLE hMutex = ::CreateMutexW(nullptr, TRUE, L"Local\\JxrAutoCleanerMutex");
   if (::GetLastError() == ERROR_ALREADY_EXISTS) {
     LogMsg(L"Another instance is already running, exiting");
     if (hMutex)
       ::CloseHandle(hMutex);
     return 0;
   }
+
+  // Trim only once we own the mutex, so we never rewrite the log while
+  // another running instance is appending to it.
+  TrimLog();
+  LogMsg(L"=== JxrAutoCleaner starting ===");
 
   // Resolve Videos folder
   g_videosDir = GetVideosFolder();
@@ -375,37 +428,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
   wc.lpszClassName = L"JxrAutoCleanerHidden";
   ::RegisterClassExW(&wc);
 
-  HWND hwnd = ::CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0,
-                                HWND_MESSAGE, nullptr, hInstance, nullptr);
+  // A hidden top-level window rather than HWND_MESSAGE: message-only windows
+  // never receive broadcasts like WM_ENDSESSION or TaskbarCreated.
+  HWND hwnd = ::CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName,
+                                L"JxrAutoCleaner", WS_POPUP, 0, 0, 0, 0,
+                                nullptr, nullptr, hInstance, nullptr);
+  if (!hwnd) {
+    LogMsg(L"Failed to create window, error %u", ::GetLastError());
+    ::CloseHandle(g_shutdownEvent);
+    if (hMutex)
+      ::CloseHandle(hMutex);
+    return 1;
+  }
 
   // Create tray icon
   CreateTrayIcon(hwnd);
 
+  // Must finish before the worker starts, or it could delete a temp file the
+  // worker is writing.
+  CleanUpOrphanTempFiles(g_videosDir);
+
   // Start threads
   std::thread watcherThread(WatcherThread, g_videosDir);
   std::thread workerThread(WorkerThread);
-
-  // Clean up any orphan temp files from previous crashes
-  try {
-    for (const auto &entry : fs::recursive_directory_iterator(g_videosDir)) {
-      if (entry.is_regular_file()) {
-        // Check if the stem ends with ".tmp" (e.g. "photo.tmp.jpg")
-        auto stem = entry.path().stem().wstring();
-        auto ext = entry.path().extension().wstring();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) {
-          return static_cast<wchar_t>(::towlower(c));
-        });
-        if (ext == L".jpg" && stem.size() >= 4 &&
-            stem.substr(stem.size() - 4) == L".tmp") {
-          LogMsg(L"Cleaning up orphan temp file: %s",
-                 entry.path().wstring().c_str());
-          std::error_code ec;
-          fs::remove(entry.path(), ec);
-        }
-      }
-    }
-  } catch (...) {
-  }
 
   // Message pump (keeps the process alive, handles tray messages)
   MSG msg;
@@ -427,8 +472,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
   RemoveTrayIcon();
 
   ::CloseHandle(g_shutdownEvent);
-  if (hwnd)
-    ::DestroyWindow(hwnd);
+  ::DestroyWindow(hwnd);
   if (hMutex)
     ::CloseHandle(hMutex);
 
