@@ -5,6 +5,7 @@
 #include "Utils.h"
 #include "resource.h"
 
+#include <atomic>
 #include <chrono>
 #include <fcntl.h>
 #include <filesystem>
@@ -30,6 +31,8 @@ static std::wstring g_videosDir;
 static HINSTANCE g_hInstance = nullptr;
 static std::thread g_watcherThread;
 static std::thread g_workerThread;
+static std::atomic<bool> g_forceRunActive = false;
+static HANDLE g_wakeEvent = nullptr;
 
 // ============================================================================
 // Registry helpers for startup toggle
@@ -85,6 +88,10 @@ static void RemoveFromStartup() {
 // ============================================================================
 static void ForceScanNow() {
   LogMsg(L"Force scan requested");
+  // Process what's queued right away, even if the system looks busy.
+  g_forceRunActive = true;
+  if (g_wakeEvent)
+    ::SetEvent(g_wakeEvent);
   size_t count = QueueUnconvertedJxrFiles(g_videosDir, g_queue);
   LogMsg(L"Force scan: queued %zu files", count);
 }
@@ -130,7 +137,7 @@ static void CleanUpOrphanTempFiles(const std::wstring &dir) {
       // Truncated, but the only thing left of that screenshot: don't delete.
       LogMsg(L"Leaving incomplete orphan temp file: %s", tmp.wstring().c_str());
     } else if (!jpgExists) {
-      // Versions before 1.1.2 deleted the JXR before renaming the finished
+      // Versions before 1.1.3 deleted the JXR before renaming the finished
       // temp file, so this may be the only copy left. Recover it.
       LogMsg(L"Recovering orphan temp file: %s", tmp.wstring().c_str());
       fs::rename(tmp, jpg, ec);
@@ -153,7 +160,7 @@ static void CreateTrayIcon(HWND hwnd) {
   g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
   g_nid.uCallbackMessage = WM_TRAYICON;
   g_nid.hIcon = ::LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1));
-  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1.2");
+  wcscpy_s(g_nid.szTip, L"JxrAutoCleaner v1.1.3");
 
   ::Shell_NotifyIconW(NIM_ADD, &g_nid);
 
@@ -217,18 +224,25 @@ static void WorkerThread() {
   while (::WaitForSingleObject(g_shutdownEvent, 0) != WAIT_OBJECT_0) {
     // Wait for a file to appear in the queue (30 second timeout)
     auto item = g_queue.wait_and_pop(std::chrono::seconds(30));
-    if (!item.has_value())
+    if (!item.has_value()) {
+      g_forceRunActive = false;
       continue;
+    }
 
     // Check if system is busy
-    if (IsSystemBusy()) {
+    if (!g_forceRunActive && IsSystemBusy()) {
       // Log only the transition; this re-checks every ~30s while busy.
       if (!wasBusy)
         LogMsg(L"Worker: system busy, deferring %zu file(s)",
                g_queue.size() + 1);
       wasBusy = true;
       g_queue.push_front(std::move(*item));
-      if (::WaitForSingleObject(g_shutdownEvent, 30000) == WAIT_OBJECT_0)
+      // Woken early by shutdown or "Force Run Now". Skip the wake event if
+      // it failed to create: a NULL handle would make the wait fail at once.
+      HANDLE events[2] = {g_shutdownEvent, g_wakeEvent};
+      DWORD count = g_wakeEvent ? 2 : 1;
+      if (::WaitForMultipleObjects(count, events, FALSE, 30000) ==
+          WAIT_OBJECT_0)
         break;
       continue;
     }
@@ -473,7 +487,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   }
 
   // --- Background service mode ---
-  // v1.1.1 and earlier held this unsuffixed name machine-wide. Don't run next
+  // v1.1.2 and earlier held this unsuffixed name machine-wide. Don't run next
   // to one (e.g. mid-upgrade), or both would convert the same files.
   if (HANDLE legacy =
           ::OpenMutexW(SYNCHRONIZE, FALSE, L"Global\\JxrAutoCleanerMutex")) {
@@ -515,6 +529,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
       ::CloseHandle(hMutex);
     return 1;
   }
+  g_wakeEvent = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
   // Register hidden window class
   WNDCLASSEXW wc = {};
@@ -558,6 +573,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
   ::CloseHandle(g_shutdownEvent);
   g_shutdownEvent = nullptr;
+  if (g_wakeEvent)
+    ::CloseHandle(g_wakeEvent);
   ::DestroyWindow(hwnd);
   if (hMutex)
     ::CloseHandle(hMutex);

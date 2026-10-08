@@ -207,7 +207,7 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 
 - **API**: `Shell_NotifyIconW` with `NOTIFYICON_VERSION_4`
 - **Icon**: Loaded from embedded resource (`IDI_ICON1`)
-- **Tooltip**: "JxrAutoCleaner v1.1.2"
+- **Tooltip**: "JxrAutoCleaner v1.1.3"
 - **Explorer restarts**: the hidden window handles the `TaskbarCreated` broadcast and re-adds the icon
 - **Context Menu**:
   - **Force Run Now** → `ForceScanNow()` — scans Videos folder, queues all unconverted `.jxr` files
@@ -221,21 +221,22 @@ JxrAutoCleaner is a Windows background service built in C++17 using Win32 APIs a
 ```cpp
 QUERY_USER_NOTIFICATION_STATE state;
 SHQueryUserNotificationState(&state);
-bool isGaming = (state == QUNS_BUSY ||
-                 state == QUNS_RUNNING_D3D_FULL_SCREEN ||
+// QUNS_BUSY is deliberately excluded: Focus Assist / Do Not Disturb also
+// report it, which made the app think you were always gaming.
+bool isGaming = (state == QUNS_RUNNING_D3D_FULL_SCREEN ||
                  state == QUNS_PRESENTATION_MODE);
 ```
 
 **CPU Load Sampling**:
 
 ```cpp
-GetSystemTimes(&idleA, &kernelA, &userA);
-Sleep(1000); // 1-second sample window
-GetSystemTimes(&idleB, &kernelB, &userB);
-double cpuPercent = (1.0 - (double)idle / (double)total) * 100.0;
+// Non-blocking: compares against the previous call's GetSystemTimes()
+// snapshot, re-sampling at most once per second (GetTickCount64).
+GetSystemTimes(&idle, &kernel, &user);
+double cpuPercent = (1.0 - (double)idleDiff / (double)totalDiff) * 100.0;
 ```
 
-**Threshold**: Conversion is deferred if CPU > 25% or gaming is detected.
+**Threshold**: Conversion is deferred if CPU > 25% or gaming is detected. **Force Run Now** bypasses this check and wakes the worker immediately.
 
 ---
 
@@ -278,7 +279,7 @@ for (int retry = 0; retry < 5; ++retry) {
 When the worker thread starts, before it converts anything, it scans for leftover `.tmp.jpg` files from previous crashes. The worker is the only writer of temp files, so none can be mid-write at that point.
 
 - If the matching `.jxr` still exists, the temp file is a partial write and is deleted.
-- If the `.jxr` is gone, the temp file ends with the JPEG EOI marker (`FF D9`), and no `.jpg` exists, it is the finished output left by pre-1.1.2 versions (which deleted before renaming). It is renamed to `.jpg` instead of being thrown away.
+- If the `.jxr` is gone, the temp file ends with the JPEG EOI marker (`FF D9`), and no `.jpg` exists, it is the finished output left by pre-1.1.3 versions (which deleted before renaming). It is renamed to `.jpg` instead of being thrown away.
 - In every other case (truncated, name taken, or the existence check errored), the file is left alone and logged.
 
 ---

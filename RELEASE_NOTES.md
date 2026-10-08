@@ -1,4 +1,4 @@
-# JxrAutoCleaner v1.1.2
+# JxrAutoCleaner v1.1.3
 
 **Patch release: fixes a data-loss bug, plus shutdown, tray and logging fixes**
 
@@ -32,9 +32,10 @@ The app used a message-only window, which never receives broadcasts, so the icon
 - Watcher buffer overflows reported as `ERROR_NOTIFY_ENUM_DIR` now trigger a rescan instead of losing the events
 - HDR float-to-half conversion now rounds to nearest instead of truncating, and NaN pixels are clamped to 0 instead of becoming infinity
 - The alpha channel is no longer scaled along with luminance
-- The single-instance lock is now per user, so two signed-in users can each run the app. A user still gets only one instance across sessions, and the app won't start while v1.1.1 or older is still running.
+- The single-instance lock is now per user, so two signed-in users can each run the app. A user still gets only one instance across sessions, and the app won't start while v1.1.2 or older is still running.
 
 ## ✨ Improvements
+
 
 - The log is written as UTF-8 and is thread-safe, so non-ASCII paths (such as a Cyrillic user name) and localized Windows error messages are logged correctly
 - "System busy" is logged once per busy period instead of every 30 seconds
@@ -44,8 +45,8 @@ The app used a message-only window, which never receives broadcasts, so the icon
 
 ## 📦 Upgrade Instructions
 
-**Existing users**: exit v1.1.1 from the tray first, then run `JxrAutoCleaner-v1.1.2.msi`. It upgrades the existing install in place. If the old version is still running, v1.1.2 exits at launch instead of running alongside it.
+**Existing users**: exit the old version from the tray first, then run `JxrAutoCleaner-v1.1.3.msi`. It upgrades the existing install in place. If the old version is still running, v1.1.3 exits at launch instead of running alongside it.
 
 ---
 
-**Full Changelog**: [v1.1.1...v1.1.2](https://github.com/ThatHunky/jxr-auto-cleaner/compare/v1.1.1...v1.1.2)
+**Full Changelog**: [v1.1.2...v1.1.3](https://github.com/ThatHunky/jxr-auto-cleaner/compare/v1.1.2...v1.1.3)
